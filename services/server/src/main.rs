@@ -56,8 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             runtime: RuntimeConfig::new(
                 PathBuf::from(string_env(
                     "HENOSIS_STATE_DIR",
-                    "/var/lib/henosis-connector-cloudflare/state-sdk-v1",
-                )),
+                    "/var/lib/henosis-connector-cloudflare/state",
+                ))
+                .join("sdk-v1"),
                 plan_store,
             ),
             telemetry_filter: "henosis=info,connector_sdk=info".into(),
