@@ -80,6 +80,17 @@ struct SubdomainResult {
     subdomain: String,
 }
 
+#[derive(Deserialize)]
+struct WranglerDeployment {
+    id: String,
+    versions: Vec<WranglerVersion>,
+}
+
+#[derive(Deserialize)]
+struct WranglerVersion {
+    version_id: String,
+}
+
 impl Target {
     /// Construct an adapter.
     #[must_use]
@@ -208,9 +219,7 @@ impl Target {
             }
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let version_id =
-            extract_after(&stdout, "Version ID:").unwrap_or_else(|| blake3_id(stdout.as_bytes()));
-        let deployment_id = version_id.clone();
+        let (deployment_id, version_id) = self.deployment_identity(&worker_name).await?;
         let claim_url = stdout
             .split_whitespace()
             .find(|word| word.starts_with("https://dash.cloudflare.com/sign-up/workers-and-pages"))
@@ -225,6 +234,46 @@ impl Target {
             version_id,
             claim_url,
         })
+    }
+
+    async fn deployment_identity(
+        &self,
+        worker_name: &str,
+    ) -> Result<(String, String), TargetError> {
+        let mut command = Command::new(&self.config.wrangler);
+        command
+            .arg("deployments")
+            .arg("list")
+            .arg("--name")
+            .arg(worker_name)
+            .arg("--json");
+        if let Some(account) = &self.config.account_id {
+            command.env("CLOUDFLARE_ACCOUNT_ID", account);
+        }
+        if let Some(token) = &self.config.api_token {
+            command.env("CLOUDFLARE_API_TOKEN", token);
+        }
+        let output = command
+            .output()
+            .await
+            .map_err(|error| TargetError::Provider(error.to_string()))?;
+        if !output.status.success() {
+            return Err(TargetError::Provider(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let deployments: Vec<WranglerDeployment> =
+            serde_json::from_slice(&output.stdout).map_err(|error| {
+                TargetError::Provider(format!("invalid Wrangler deployment JSON: {error}"))
+            })?;
+        let deployment = deployments.first().ok_or_else(|| {
+            TargetError::Provider("Wrangler returned no deployment after deploy".into())
+        })?;
+        let version = deployment
+            .versions
+            .first()
+            .ok_or_else(|| TargetError::Provider("Wrangler deployment has no version".into()))?;
+        Ok((deployment.id.clone(), version.version_id.clone()))
     }
 
     /// Delete a deployed Worker.
@@ -325,20 +374,6 @@ fn stage(files: &[crate::context::ProjectFile], root: &Path) -> Result<(), Targe
         fs::write(path, &file.bytes).map_err(|error| TargetError::Stage(error.to_string()))?;
     }
     Ok(())
-}
-
-fn extract_after(output: &str, marker: &str) -> Option<String> {
-    output
-        .lines()
-        .find_map(|line| {
-            line.split_once(marker)
-                .map(|(_, value)| value.trim().to_owned())
-        })
-        .filter(|value| !value.is_empty())
-}
-
-fn blake3_id(bytes: &[u8]) -> String {
-    hex::encode(&blake3::hash(bytes).as_bytes()[..16])
 }
 
 #[cfg(test)]
