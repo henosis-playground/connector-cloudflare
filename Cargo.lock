@@ -664,6 +664,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "henosis-cloudflare-derive-component"
+version = "0.1.0"
+dependencies = [
+ "henosis-cloudflare-authoring",
+ "hex",
+ "serde_json",
+]
+
+[[package]]
 name = "henosis-cloudflare-reconciler"
 version = "0.1.0"
 dependencies = [

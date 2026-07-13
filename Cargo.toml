@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "services/*"]
+members = ["crates/*", "services/*", "tools/*"]
 
 [workspace.package]
 repository = "https://github.com/henosis-playground/connector-cloudflare"

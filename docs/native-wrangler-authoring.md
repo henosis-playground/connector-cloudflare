@@ -8,6 +8,10 @@ A component is a standard Cloudflare Worker project. The connector reads `wrangl
 - `dev` and `prod` map to `<name>-dev` and `<name>-prod`.
 - `preview_<26-character-id>` maps to `<name>-preview-<first-12-id-characters>`, lowercased. Names longer than 63 characters are truncated with an 8-hex digest suffix.
 
-The authoring boundary receives immutable dependency hashes from graph metadata. It uses those hashes for `depends_on` and for exact upstream-value lookup; names are retained for diagnostics only.
+The authoring boundary receives immutable dependency hashes from graph metadata. It uses those hashes for `depends_on` and for exact upstream-value lookup; names are retained for diagnostics only. The workspace CLI prints the derived registration material:
+
+```sh
+cargo run -p henosis-cloudflare-derive-component -- ../service-f dev service-e=<64-hex-spec-hash>
+```
 
 An empty `[vars]` value cannot identify its producer and output from Wrangler alone. That shorthand remains an open question; the explicit interpolation form below is the supported convention.
