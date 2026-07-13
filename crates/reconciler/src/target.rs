@@ -140,16 +140,19 @@ impl Target {
                 subdomain: subdomain.clone(),
             });
         }
-        let account = self.config.account_id.as_ref().ok_or_else(|| {
-            TargetError::Config(
-                "CLOUDFLARE_ACCOUNT_ID is required for plan-time workers.dev URLs".into(),
-            )
-        })?;
-        let token = self.config.api_token.as_ref().ok_or_else(|| {
-            TargetError::Config(
-                "CLOUDFLARE_API_TOKEN is required for plan-time workers.dev URLs".into(),
-            )
-        })?;
+        let (Some(account), Some(token)) = (
+            self.config.account_id.as_ref(),
+            self.config.api_token.as_ref(),
+        ) else {
+            if self.config.account_id.is_none() && self.config.api_token.is_none() {
+                return Ok(AccountFacts {
+                    subdomain: String::new(),
+                });
+            }
+            return Err(TargetError::Config(
+                "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be configured together".into(),
+            ));
+        };
         let response = self
             .client
             .get(format!(
@@ -266,7 +269,7 @@ impl Target {
                     .to_owned()
             });
         Ok(Deployment {
-            url: format!("https://{worker_name}.{}.workers.dev", facts.subdomain),
+            url: deployed_url(&stdout, &worker_name, &facts.subdomain),
             deployment_id,
             version_id,
             claim_url,
@@ -433,6 +436,20 @@ impl Target {
             ))
         }
     }
+}
+
+fn deployed_url(stdout: &str, worker_name: &str, subdomain: &str) -> String {
+    let observed = stdout
+        .split_whitespace()
+        .find(|word| word.starts_with("https://") && word.contains(".workers.dev"));
+    let Some(value) = observed else {
+        return format!("https://{worker_name}.{subdomain}.workers.dev");
+    };
+    value
+        .trim_end_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '/' | '.' | '-')
+        })
+        .to_owned()
 }
 
 #[derive(Debug)]

@@ -191,6 +191,7 @@ impl Reconciler {
         let desired = DesiredSlice::from_request(request)?;
         let lock = self.graph_lock(desired.graph_id).await;
         let _guard = lock.lock().await;
+        let mut retained_deployments = HashMap::new();
         if let Some(mut current) = self.load(desired.graph_id)? {
             if current.retired {
                 return Err(ReconcileError::Retired);
@@ -213,12 +214,18 @@ impl Reconciler {
                 self.schedule(current.desired.graph_id, sequence, Duration::ZERO);
                 return Ok(sequence);
             }
+            for component in &desired.components {
+                let key = desired.deployment_key(component);
+                if let Some(deployment) = current.deployments.remove(&key) {
+                    retained_deployments.insert(key, deployment);
+                }
+            }
         }
         let sequence = desired.sequence;
         self.save(&Checkpoint {
             desired: desired.clone(),
             phase: Phase::Accepted,
-            deployments: HashMap::new(),
+            deployments: retained_deployments,
             pending_report: None,
             retired: false,
         })?;
@@ -295,91 +302,140 @@ impl Reconciler {
         }
         match checkpoint.phase {
             Phase::Accepted => {
-                let facts = self.facts().await.map_err(|error| target_state(&error))?;
-                let outputs = plan_outputs(&checkpoint.desired, &facts)?;
-                checkpoint.phase = Phase::Planned;
-                let report = report_for(
-                    &checkpoint.desired,
-                    ComponentDispositionKind::Ready,
-                    outputs,
-                    vec![diagnostic(
-                        "cloudflare.plan.ready",
-                        "plan-time workers.dev URL published before deployment; the deployed core \
-                         contract requires publishable slices to use the ready disposition",
-                    )],
-                    None,
-                );
-                self.publish(&mut checkpoint, report, true)?;
+                self.plan_once(&mut checkpoint, graph_id, expected_sequence)
+                    .await
             }
             Phase::Planned => {
-                let facts = self.facts().await.map_err(|error| target_state(&error))?;
-                let mut components = checkpoint.desired.components.iter().collect::<Vec<_>>();
-                components.sort_by_key(|component| component.context.is_tunnel());
-                for component in components {
-                    let deployment_key = hex::encode(component.spec_hash);
-                    if checkpoint.deployments.contains_key(&deployment_key) {
-                        continue;
-                    }
-                    match self
-                        .target
-                        .deploy(&checkpoint.desired, component, &facts)
-                        .await
+                self.apply_once(&mut checkpoint, graph_id, expected_sequence)
+                    .await
+            }
+            Phase::Ready => Ok(()),
+        }
+    }
+
+    async fn plan_once(
+        self: &Arc<Self>,
+        checkpoint: &mut Checkpoint,
+        graph_id: [u8; 16],
+        expected_sequence: u64,
+    ) -> Result<(), ReconcileError> {
+        let facts = self.facts().await.map_err(|error| target_state(&error))?;
+        checkpoint.phase = Phase::Planned;
+        if facts.subdomain.is_empty() {
+            self.save(checkpoint)?;
+            self.schedule(graph_id, expected_sequence, Duration::ZERO);
+            return Ok(());
+        }
+        let outputs = plan_outputs(&checkpoint.desired, &facts)?;
+        let report = report_for(
+            &checkpoint.desired,
+            ComponentDispositionKind::Ready,
+            outputs,
+            vec![diagnostic(
+                "cloudflare.plan.ready",
+                "plan-time workers.dev URL published before deployment; the deployed core \
+                 contract requires publishable slices to use the ready disposition",
+            )],
+            None,
+        );
+        self.publish(checkpoint, report, true)
+    }
+
+    async fn apply_once(
+        self: &Arc<Self>,
+        checkpoint: &mut Checkpoint,
+        graph_id: [u8; 16],
+        expected_sequence: u64,
+    ) -> Result<(), ReconcileError> {
+        let mut facts = self.facts().await.map_err(|error| target_state(&error))?;
+        if facts.subdomain.is_empty()
+            && let Some(subdomain) = checkpoint
+                .deployments
+                .values()
+                .find_map(|deployment| workers_subdomain(&deployment.url))
+        {
+            facts.subdomain = subdomain;
+        }
+        let mut components = checkpoint.desired.components.iter().collect::<Vec<_>>();
+        components.sort_by_key(|component| {
+            let internal_dependencies = component
+                .context
+                .slots
+                .iter()
+                .filter(|slot| {
+                    checkpoint
+                        .desired
+                        .components
+                        .get(&slot.producer_spec_hash)
+                        .is_some()
+                })
+                .count();
+            (component.context.is_tunnel(), internal_dependencies)
+        });
+        for component in components {
+            let deployment_key = checkpoint.desired.deployment_key(component);
+            if checkpoint.deployments.contains_key(&deployment_key) {
+                continue;
+            }
+            match self
+                .target
+                .deploy(&checkpoint.desired, component, &facts)
+                .await
+            {
+                Ok(deployment) => {
+                    if facts.subdomain.is_empty()
+                        && let Some(subdomain) = workers_subdomain(&deployment.url)
                     {
-                        Ok(deployment) => {
-                            checkpoint
-                                .deployments
-                                .insert(deployment_key, deployment.into());
-                            self.save(&checkpoint)?;
-                        }
-                        Err(TargetError::Config(detail))
-                            if detail.contains("cloudflare.input.unbound") =>
-                        {
-                            let report = report_for(
-                                &checkpoint.desired,
-                                ComponentDispositionKind::Reconciling,
-                                Vec::new(),
-                                vec![diagnostic("cloudflare.input.unbound", &detail)],
-                                None,
-                            );
-                            self.publish(&mut checkpoint, report, false)?;
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            let report = report_for(
-                                &checkpoint.desired,
-                                ComponentDispositionKind::Reconciling,
-                                Vec::new(),
-                                vec![diagnostic(
-                                    "cloudflare.target.unavailable",
-                                    &error.to_string(),
-                                )],
-                                None,
-                            );
-                            self.publish(&mut checkpoint, report, false)?;
-                            self.schedule(graph_id, expected_sequence, Duration::from_secs(2));
-                            return Ok(());
-                        }
+                        facts.subdomain = subdomain;
                     }
-                    self.schedule(graph_id, expected_sequence, Duration::ZERO);
+                    checkpoint
+                        .deployments
+                        .insert(deployment_key, deployment.into());
+                    self.save(checkpoint)?;
+                }
+                Err(TargetError::Config(detail)) if detail.contains("cloudflare.input.unbound") => {
+                    let report = report_for(
+                        &checkpoint.desired,
+                        ComponentDispositionKind::Reconciling,
+                        Vec::new(),
+                        vec![diagnostic("cloudflare.input.unbound", &detail)],
+                        None,
+                    );
+                    self.publish(checkpoint, report, false)?;
                     return Ok(());
                 }
-                checkpoint.phase = Phase::Ready;
-                let outputs = ready_outputs(&checkpoint.desired, &checkpoint.deployments)?;
-                let evidence = PublicationEvidence::default()
-                    .with_revision(format!("generation:{}", checkpoint.desired.generation))
-                    .with_uri("cloudflare://workers/deployments");
-                let report = report_for(
-                    &checkpoint.desired,
-                    ComponentDispositionKind::Ready,
-                    outputs,
-                    Vec::new(),
-                    Some(evidence),
-                );
-                self.publish(&mut checkpoint, report, true)?;
+                Err(error) => {
+                    let report = report_for(
+                        &checkpoint.desired,
+                        ComponentDispositionKind::Reconciling,
+                        Vec::new(),
+                        vec![diagnostic(
+                            "cloudflare.target.unavailable",
+                            &error.to_string(),
+                        )],
+                        None,
+                    );
+                    self.publish(checkpoint, report, false)?;
+                    self.schedule(graph_id, expected_sequence, Duration::from_secs(2));
+                    return Ok(());
+                }
             }
-            Phase::Ready => {}
+            self.schedule(graph_id, expected_sequence, Duration::ZERO);
+            return Ok(());
         }
-        Ok(())
+        checkpoint.phase = Phase::Ready;
+        let outputs = ready_outputs(&checkpoint.desired, &checkpoint.deployments)?;
+        let evidence = PublicationEvidence::default()
+            .with_revision(format!("generation:{}", checkpoint.desired.generation))
+            .with_uri("cloudflare://workers/deployments");
+        let report = report_for(
+            &checkpoint.desired,
+            ComponentDispositionKind::Ready,
+            outputs,
+            Vec::new(),
+            Some(evidence),
+        );
+        self.publish(checkpoint, report, true)
     }
 
     async fn facts(&self) -> Result<AccountFacts, TargetError> {
@@ -568,6 +624,13 @@ impl From<Deployment> for DeploymentSnapshot {
     }
 }
 
+fn workers_subdomain(url: &str) -> Option<String> {
+    let host = url.strip_prefix("https://")?.split('/').next()?;
+    host.strip_suffix(".workers.dev")?
+        .split_once('.')
+        .map(|(_, subdomain)| subdomain.to_owned())
+}
+
 fn plan_outputs(
     desired: &DesiredSlice,
     facts: &AccountFacts,
@@ -606,7 +669,7 @@ fn ready_outputs(
         .iter()
         .map(|component| {
             let deployment = deployments
-                .get(&hex::encode(component.spec_hash))
+                .get(&desired.deployment_key(component))
                 .ok_or_else(|| ReconcileError::State("ready deployment missing".into()))?;
             let resource_name = component
                 .context
