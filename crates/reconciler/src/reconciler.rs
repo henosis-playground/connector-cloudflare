@@ -1,868 +1,722 @@
-//! Durable two-phase Cloudflare reconciliation with persistent report delivery.
+//! Cloudflare target lifecycle implemented against the shared connector SDK.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::fs::{self};
-use std::future::Future;
-use std::io::Write as _;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use buffa::MessageField;
-use connectrpc::ErrorCode;
-use connectrpc::client::ClientConfig;
-use connectrpc::client::HttpClient;
-use http::Uri;
+use connector_sdk::ApplyOutcome;
+use connector_sdk::Approved;
+use connector_sdk::BlockedInput;
+use connector_sdk::ConcurrencyScope;
+use connector_sdk::Connector;
+use connector_sdk::ContractError;
+use connector_sdk::Diagnostic;
+use connector_sdk::Output;
+use connector_sdk::PassContext;
+use connector_sdk::PlanOutcome;
+use connector_sdk::PlanProposal;
+use connector_sdk::Publication;
+use connector_sdk::RetireContext;
+use connector_sdk::RetireOutcome;
+use connector_sdk::Retry;
+use connector_sdk::ReviewProjection;
+use connector_sdk::TargetSlice;
+use connector_sdk::UnknownSlot;
 use serde::Deserialize;
 use serde::Serialize;
-use tempfile::NamedTempFile;
-use thiserror::Error;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
-use uuid::Uuid;
 
-use crate::proto::ComponentDisposition;
-use crate::proto::ComponentDispositionKind;
-use crate::proto::ComponentOutputs;
-use crate::proto::ConnectorCallbackServiceClient;
-use crate::proto::Diagnostic;
-use crate::proto::DiagnosticSeverity;
-use crate::proto::PublicationEvidence;
-use crate::proto::ReportSliceRequest;
-use crate::proto::SliceReport;
-use crate::retry::Backoff;
+use crate::slice::ComponentPin;
 use crate::slice::DesiredSlice;
-use crate::slice::SliceError;
 use crate::target::AccountFacts;
 use crate::target::Deployment;
 use crate::target::Target;
 use crate::target::TargetError;
 
-const CHECKPOINT_VERSION: u32 = 1;
-const PUBLICATION_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x4f, 0x8f, 0x0c, 0xcd, 0x59, 0xa5, 0x55, 0x60, 0xa6, 0x8f, 0xa4, 0x24, 0x61, 0x29, 0xdd, 0x4e,
-]);
-
-/// Callback delivery boundary.
-pub trait Reporter: Send + Sync + 'static {
-    /// Atomically deliver one complete report level.
-    fn report(
-        &self,
-        request: ReportSliceRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + '_>>;
+/// Fresh Cloudflare facts used to classify create versus update.
+pub struct Observation {
+    facts: AccountFacts,
+    existing_workers: BTreeSet<String>,
 }
 
-/// Core callback failure.
-#[derive(Debug, Error)]
-pub enum ReportError {
-    /// Core permanently rejected this graph report.
-    #[error("core permanently rejected report: {0}")]
-    Terminal(String),
-    /// Delivery can be retried.
-    #[error("core callback failed: {0}")]
-    Retryable(String),
+/// Complete private Cloudflare plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CloudflarePlan {
+    pub desired_digest: String,
+    pub operations: Vec<PlannedOperation>,
 }
 
-impl ReportError {
-    fn from_connect(error: &connectrpc::ConnectError) -> Self {
-        if matches!(
-            error.code,
-            ErrorCode::FailedPrecondition | ErrorCode::NotFound
-        ) {
-            Self::Terminal(error.to_string())
-        } else {
-            Self::Retryable(error.to_string())
-        }
-    }
+/// One target mutation covered by the plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PlannedOperation {
+    pub action: PlanAction,
+    pub worker_name: String,
+    pub component: ComponentPin,
 }
 
-/// Generated-contract callback client.
-#[derive(Clone)]
-pub struct CoreReporter {
-    client: ConnectorCallbackServiceClient<HttpClient>,
-}
-
-impl CoreReporter {
-    /// Build a callback client.
-    pub fn new(uri: Uri, token: Option<String>) -> Self {
-        let mut config = ClientConfig::new(uri);
-        if let Some(token) = token {
-            config = config.with_default_header("authorization", format!("Bearer {token}"));
-        }
-        Self {
-            client: ConnectorCallbackServiceClient::new(HttpClient::plaintext(), config),
-        }
-    }
-}
-
-impl Reporter for CoreReporter {
-    fn report(
-        &self,
-        request: ReportSliceRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + '_>> {
-        Box::pin(async move {
-            self.client
-                .report_slice(request)
-                .await
-                .map(|_| ())
-                .map_err(|error| ReportError::from_connect(&error))
-        })
-    }
-}
-
-/// Controller configuration.
-#[derive(Clone, Debug)]
-pub struct ReconcilerConfig {
-    /// Connector-owned state root.
-    pub state_dir: PathBuf,
-}
-
-/// Service-boundary reconciliation failure.
-#[derive(Debug, Error)]
-pub enum ReconcileError {
-    /// Invalid shared request.
-    #[error("invalid slice: {0}")]
-    Invalid(#[from] SliceError),
-    /// Retired graph cannot be reused.
-    #[error("graph is retired")]
-    Retired,
-    /// Equal sequence changed content.
-    #[error("slice sequence conflict")]
-    SequenceConflict,
-    /// Durable state failed.
-    #[error("connector state failure: {0}")]
-    State(String),
-}
-
-/// Durable level-triggered controller.
-pub struct Reconciler {
-    config: ReconcilerConfig,
-    target: Target,
-    reporter: Arc<dyn Reporter>,
-    account_facts: Mutex<Option<AccountFacts>>,
-    graph_locks: RwLock<HashMap<[u8; 16], Arc<Mutex<()>>>>,
-    reconcile_backoffs: Mutex<HashMap<[u8; 16], Backoff>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CheckpointEnvelope {
-    version: u32,
-    state: Checkpoint,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Checkpoint {
-    desired: DesiredSlice,
-    phase: Phase,
-    deployments: HashMap<String, DeploymentSnapshot>,
-    pending_report: Option<ReportSnapshot>,
-    retired: bool,
-}
-
+/// Cloudflare mutation classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum Phase {
-    Accepted,
-    Planned,
-    Ready,
+#[serde(rename_all = "kebab-case")]
+pub enum PlanAction {
+    Create,
+    Update,
+    Delete,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeploymentSnapshot {
-    url: String,
-    deployment_id: String,
-    version_id: String,
-    claim_url: Option<String>,
+/// Cloudflare lifecycle hooks.
+pub struct CloudflareConnector {
+    target: Target,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReportSnapshot {
-    request_id: Vec<u8>,
-    publication_id: Option<Vec<u8>>,
-    report: SliceReport,
+impl CloudflareConnector {
+    #[must_use]
+    pub fn new(target: Target) -> Self {
+        Self { target }
+    }
 }
 
-impl Reconciler {
-    /// Construct the controller.
-    pub fn new(
-        config: ReconcilerConfig,
-        target: Target,
-        reporter: Arc<dyn Reporter>,
-    ) -> Result<Self, ReconcileError> {
-        fs::create_dir_all(config.state_dir.join("graphs")).map_err(state)?;
-        Ok(Self {
-            config,
-            target,
-            reporter,
-            account_facts: Mutex::new(None),
-            graph_locks: RwLock::new(HashMap::new()),
-            reconcile_backoffs: Mutex::new(HashMap::new()),
+#[async_trait::async_trait]
+impl Connector for CloudflareConnector {
+    type Desired = DesiredSlice;
+    type Observation = Observation;
+    type Plan = CloudflarePlan;
+
+    fn name(&self) -> &'static str {
+        crate::CONNECTOR_NAME
+    }
+
+    fn decode(&self, slice: &TargetSlice) -> Result<Self::Desired, ContractError> {
+        DesiredSlice::decode(slice)
+    }
+
+    fn prepare_transition(
+        &self,
+        _previous_slice: &TargetSlice,
+        previous: &Self::Desired,
+        _next_slice: &TargetSlice,
+        next: &mut Self::Desired,
+    ) -> Result<(), ContractError> {
+        let current_names = next
+            .components
+            .iter()
+            .map(|component| component.context.deployed_name())
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| ContractError::target(error.to_string()))?;
+        next.removed_components = previous
+            .components
+            .iter()
+            .filter(|component| {
+                component
+                    .context
+                    .deployed_name()
+                    .is_ok_and(|name| !current_names.contains(&name))
+            })
+            .cloned()
+            .collect();
+        Ok(())
+    }
+
+    fn concurrency_scope(&self, _desired: &Self::Desired) -> ConcurrencyScope {
+        ConcurrencyScope::Connector
+    }
+
+    async fn observe(
+        &self,
+        _context: PassContext<'_>,
+        desired: &Self::Desired,
+    ) -> Result<Self::Observation, PlanOutcome<Self::Plan>> {
+        let facts = self
+            .target
+            .account_facts()
+            .await
+            .map_err(|error| blocked_target_plan("account facts", &error))?;
+        let mut existing_workers = BTreeSet::new();
+        for component in &desired.components {
+            if component.context.is_tunnel() {
+                continue;
+            }
+            let name = component
+                .context
+                .deployed_name()
+                .map_err(|error| failed_plan("worker identity", error.to_string()))?;
+            if self
+                .target
+                .worker_exists(&name)
+                .await
+                .map_err(|error| blocked_target_plan("worker observation", &error))?
+            {
+                existing_workers.insert(name);
+            }
+        }
+        Ok(Observation {
+            facts,
+            existing_workers,
         })
     }
 
-    /// Accept a full desired level and begin plan/apply passes.
-    pub async fn accept(
-        self: &Arc<Self>,
-        request: &crate::proto::ReconcileSliceRequestView<'_>,
-    ) -> Result<u64, ReconcileError> {
-        let desired = DesiredSlice::from_request(request)?;
-        self.reset_reconcile_backoff(desired.graph_id).await;
-        let lock = self.graph_lock(desired.graph_id).await;
-        let _guard = lock.lock().await;
-        let mut retained_deployments = HashMap::new();
-        if let Some(mut current) = self.load(desired.graph_id)? {
-            if current.retired {
-                return Err(ReconcileError::Retired);
-            }
-            if desired.sequence < current.desired.sequence {
-                return Ok(current.desired.sequence);
-            }
-            if desired.sequence == current.desired.sequence {
-                if desired.digest() != current.desired.digest() {
-                    return Err(ReconcileError::SequenceConflict);
-                }
-                self.schedule(desired.graph_id, desired.sequence, Duration::ZERO);
-                return Ok(desired.sequence);
-            }
-            if desired.target_digest() == current.desired.target_digest() {
-                let sequence = desired.sequence;
-                current.desired = desired;
-                current.pending_report = None;
-                self.save(&current)?;
-                self.schedule(current.desired.graph_id, sequence, Duration::ZERO);
-                return Ok(sequence);
-            }
-            for component in &desired.components {
-                let key = desired.deployment_key(component);
-                if let Some(deployment) = current.deployments.remove(&key) {
-                    retained_deployments.insert(key, deployment);
-                }
-            }
-        }
-        let sequence = desired.sequence;
-        self.save(&Checkpoint {
-            desired: desired.clone(),
-            phase: Phase::Accepted,
-            deployments: retained_deployments,
-            pending_report: None,
-            retired: false,
-        })?;
-        self.schedule(desired.graph_id, sequence, Duration::ZERO);
-        Ok(sequence)
-    }
-
-    /// Resume report delivery and reconciliation from versioned checkpoints.
-    pub fn resume(self: &Arc<Self>) -> Result<usize, ReconcileError> {
-        let mut count = 0;
-        for entry in fs::read_dir(self.config.state_dir.join("graphs")).map_err(state)? {
-            let path = entry.map_err(state)?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let checkpoint = Self::load_path(&path)?;
-            if checkpoint.retired {
-                continue;
-            }
-            if let Some(snapshot) = checkpoint.pending_report.clone() {
-                self.retry_report(checkpoint.desired.graph_id, snapshot);
-            }
-            self.schedule(
-                checkpoint.desired.graph_id,
-                checkpoint.desired.sequence,
-                Duration::ZERO,
-            );
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Delete all Workers and terminally retire the graph.
-    pub async fn retire(
+    async fn plan(
         &self,
-        graph_id: [u8; 16],
-        generation: u64,
-        sequence: u64,
-    ) -> Result<u64, ReconcileError> {
-        let lock = self.graph_lock(graph_id).await;
-        let _guard = lock.lock().await;
-        let mut checkpoint = self
-            .load(graph_id)?
-            .ok_or_else(|| ReconcileError::State("cannot retire unknown graph".into()))?;
-        if checkpoint.desired.generation != generation || sequence < checkpoint.desired.sequence {
-            return Err(ReconcileError::State(
-                "retire identity does not match retained level".into(),
-            ));
+        _context: PassContext<'_>,
+        desired: &Self::Desired,
+        observed: &Self::Observation,
+    ) -> PlanOutcome<Self::Plan> {
+        let blocked = blocked_inputs(desired);
+        if !blocked.is_empty() {
+            let mut proposal = PlanProposal::declarative(ReviewProjection {
+                json: serde_json::json!({
+                    "status": "blocked",
+                    "blockedOnInputs": blocked,
+                }),
+                markdown: blocked_markdown(&blocked),
+            });
+            proposal.blocked_on_inputs = blocked;
+            return PlanOutcome::Waiting {
+                proposal,
+                diagnostics: vec![Diagnostic::info(
+                    "cloudflare.input.unbound",
+                    "Cloudflare plan is blocked on required producer outputs",
+                )],
+                retry: Retry::after(Duration::from_secs(2)),
+            };
         }
-        for component in &checkpoint.desired.components {
-            self.target
-                .delete(component)
-                .await
-                .map_err(|error| target_state(&error))?;
-        }
-        checkpoint.retired = true;
-        checkpoint.pending_report = None;
-        self.save(&checkpoint)?;
-        Ok(generation)
-    }
 
-    async fn reconcile_once(
-        self: Arc<Self>,
-        graph_id: [u8; 16],
-        expected_sequence: u64,
-    ) -> Result<(), ReconcileError> {
-        let lock = self.graph_lock(graph_id).await;
-        let _guard = lock.lock().await;
-        let Some(mut checkpoint) = self.load(graph_id)? else {
-            return Ok(());
+        let mut operations = Vec::new();
+        for component in &desired.removed_components {
+            let worker_name = match component.context.deployed_name() {
+                Ok(value) => value,
+                Err(error) => return failed_plan("removed worker identity", error.to_string()),
+            };
+            operations.push(PlannedOperation {
+                action: PlanAction::Delete,
+                worker_name,
+                component: component.clone(),
+            });
+        }
+        for component in &desired.components {
+            let worker_name = match component.context.deployed_name() {
+                Ok(value) => value,
+                Err(error) => return failed_plan("worker identity", error.to_string()),
+            };
+            let action = if observed.existing_workers.contains(&worker_name) {
+                PlanAction::Update
+            } else {
+                PlanAction::Create
+            };
+            operations.push(PlannedOperation {
+                action,
+                worker_name,
+                component: component.clone(),
+            });
+        }
+        let plan = CloudflarePlan {
+            desired_digest: format!("blake3:{}", hex::encode(desired.digest())),
+            operations,
         };
-        if checkpoint.retired || checkpoint.desired.sequence != expected_sequence {
-            return Ok(());
+        let projection = review_projection(&plan, desired, &observed.facts);
+        if plan.operations.is_empty() {
+            return PlanOutcome::Ready {
+                proposal: PlanProposal::executable(plan, projection),
+                outputs: Vec::new(),
+                diagnostics: Vec::new(),
+                publication: None,
+            };
         }
-        match checkpoint.phase {
-            Phase::Accepted => {
-                self.plan_once(&mut checkpoint, graph_id, expected_sequence)
-                    .await
+        let mut proposal = PlanProposal::executable(plan, projection);
+        for component in &desired.components {
+            let hash = hex::encode(component.spec_hash);
+            let fields = if component.context.is_tunnel() {
+                ["tunnelId", "capability"]
+            } else {
+                ["deploymentId", "versionId"]
+            };
+            for field in fields {
+                proposal.unknown_slots.push(UnknownSlot {
+                    path: format!("/outputs/{hash}/{field}"),
+                    reason: "Cloudflare assigns this value while applying the deployment".into(),
+                });
             }
-            Phase::Planned => {
-                self.apply_once(&mut checkpoint, graph_id, expected_sequence)
-                    .await
+            if !component.context.is_tunnel() {
+                proposal.unknown_slots.push(UnknownSlot {
+                    path: format!("/outputs/{hash}/claimUrl"),
+                    reason: "present only when Cloudflare returns a temporary-account claim URL"
+                        .into(),
+                });
             }
-            Phase::Ready => Ok(()),
+            if observed.facts.subdomain.is_empty() && !component.context.is_tunnel() {
+                proposal.unknown_slots.push(UnknownSlot {
+                    path: format!("/outputs/{hash}/url"),
+                    reason: "workers.dev subdomain is discovered from Wrangler during apply".into(),
+                });
+            }
         }
+        PlanOutcome::Apply(proposal)
     }
 
-    async fn plan_once(
-        self: &Arc<Self>,
-        checkpoint: &mut Checkpoint,
-        graph_id: [u8; 16],
-        expected_sequence: u64,
-    ) -> Result<(), ReconcileError> {
-        let facts = self.facts().await.map_err(|error| target_state(&error))?;
-        checkpoint.phase = Phase::Planned;
-        if facts.subdomain.is_empty() {
-            self.save(checkpoint)?;
-            self.schedule(graph_id, expected_sequence, Duration::ZERO);
-            return Ok(());
+    async fn apply(
+        &self,
+        _context: PassContext<'_>,
+        desired: &Self::Desired,
+        approved: &Approved<Self::Plan>,
+    ) -> ApplyOutcome {
+        let plan = approved.plan();
+        if plan.desired_digest != format!("blake3:{}", hex::encode(desired.digest())) {
+            return ApplyOutcome::Failed(vec![Diagnostic::error(
+                "cloudflare.plan.identity",
+                "approved plan does not match the current desired level",
+            )]);
         }
-        let outputs = plan_outputs(&checkpoint.desired, &facts)?;
-        let report = report_for(
-            &checkpoint.desired,
-            ComponentDispositionKind::Ready,
+        let facts = match self.target.account_facts().await {
+            Ok(value) => value,
+            Err(error) => return target_waiting(&error),
+        };
+        let mut deployments = BTreeMap::new();
+        for operation in &plan.operations {
+            match operation.action {
+                PlanAction::Delete => {
+                    if let Err(error) = self.target.delete(&operation.component).await {
+                        return target_failure(&error);
+                    }
+                }
+                PlanAction::Create | PlanAction::Update => {
+                    match self
+                        .target
+                        .deploy(desired, &operation.component, &facts)
+                        .await
+                    {
+                        Ok(deployment) => {
+                            deployments.insert(operation.component.spec_hash, deployment);
+                        }
+                        Err(error) => return target_failure(&error),
+                    }
+                }
+            }
+        }
+        let outputs = match ready_outputs(desired, &deployments) {
+            Ok(outputs) => outputs,
+            Err(message) => {
+                return ApplyOutcome::Failed(vec![Diagnostic::error(
+                    "cloudflare.outputs.incomplete",
+                    message,
+                )]);
+            }
+        };
+        ApplyOutcome::Ready {
             outputs,
-            vec![diagnostic(
-                "cloudflare.plan.ready",
-                "plan-time workers.dev URL published before deployment; the deployed core \
-                 contract requires publishable slices to use the ready disposition",
+            diagnostics: vec![Diagnostic::info(
+                "cloudflare.plan.applied",
+                format!(
+                    "S2 plan {} applied {} Cloudflare mutations",
+                    approved.digest(),
+                    plan.operations.len()
+                ),
             )],
-            None,
-        );
-        self.publish(checkpoint, report, true)
+            publication: (!desired.components.is_empty()).then(|| Publication {
+                revision: format!("generation:{}", desired.generation),
+                uri: "cloudflare://workers/deployments".into(),
+            }),
+        }
     }
 
-    async fn apply_once(
-        self: &Arc<Self>,
-        checkpoint: &mut Checkpoint,
-        graph_id: [u8; 16],
-        expected_sequence: u64,
-    ) -> Result<(), ReconcileError> {
-        let mut facts = self.facts().await.map_err(|error| target_state(&error))?;
-        if facts.subdomain.is_empty()
-            && let Some(subdomain) = checkpoint
-                .deployments
-                .values()
-                .find_map(|deployment| workers_subdomain(&deployment.url))
-        {
-            facts.subdomain = subdomain;
+    async fn retire(
+        &self,
+        _context: RetireContext<'_>,
+        desired: Option<&Self::Desired>,
+    ) -> RetireOutcome {
+        let Some(desired) = desired else {
+            return RetireOutcome::Blocked(vec![Diagnostic::error(
+                "cloudflare.retire.unknown",
+                "cannot retire an unknown Cloudflare graph",
+            )]);
+        };
+        for component in &desired.components {
+            if let Err(error) = self.target.delete(component).await {
+                return match error {
+                    TargetError::Config(detail) => RetireOutcome::Blocked(vec![Diagnostic::error(
+                        "cloudflare.retire.blocked",
+                        detail,
+                    )]),
+                    TargetError::Provider(_) | TargetError::Stage(_) => {
+                        RetireOutcome::Waiting(Retry::after(Duration::from_secs(2)))
+                    }
+                };
+            }
         }
-        let mut components = checkpoint.desired.components.iter().collect::<Vec<_>>();
-        components.sort_by_key(|component| {
-            let internal_dependencies = component
+        RetireOutcome::Absent
+    }
+}
+
+fn blocked_inputs(desired: &DesiredSlice) -> Vec<BlockedInput> {
+    let mut blocked = Vec::new();
+    for component in &desired.components {
+        for slot in &component.context.slots {
+            let available = desired
+                .upstream_outputs
+                .iter()
+                .find(|output| output.component_spec_hash == slot.producer_spec_hash)
+                .and_then(|output| {
+                    serde_json::from_slice::<serde_json::Value>(&output.values_json).ok()
+                })
+                .and_then(|value| value.get(&slot.output).cloned())
+                .is_some();
+            if !available {
+                blocked.push(BlockedInput {
+                    path: format!(
+                        "/components/{}/vars/{}",
+                        hex::encode(component.spec_hash),
+                        slot.key
+                    ),
+                    producer: hex::encode(slot.producer_spec_hash),
+                    output: slot.output.clone(),
+                });
+            }
+        }
+    }
+    blocked
+}
+
+fn review_projection(
+    plan: &CloudflarePlan,
+    desired: &DesiredSlice,
+    facts: &AccountFacts,
+) -> ReviewProjection {
+    let operations = plan
+        .operations
+        .iter()
+        .map(|operation| {
+            let vars = operation
+                .component
                 .context
                 .slots
                 .iter()
-                .filter(|slot| {
-                    checkpoint
-                        .desired
-                        .components
-                        .get(&slot.producer_spec_hash)
-                        .is_some()
-                })
-                .count();
-            (component.context.is_tunnel(), internal_dependencies)
-        });
-        for component in components {
-            let deployment_key = checkpoint.desired.deployment_key(component);
-            if checkpoint.deployments.contains_key(&deployment_key) {
-                continue;
-            }
-            match self
-                .target
-                .deploy(&checkpoint.desired, component, &facts)
-                .await
-            {
-                Ok(deployment) => {
-                    self.reset_reconcile_backoff(graph_id).await;
-                    if facts.subdomain.is_empty()
-                        && let Some(subdomain) = workers_subdomain(&deployment.url)
-                    {
-                        facts.subdomain = subdomain;
-                    }
-                    checkpoint
-                        .deployments
-                        .insert(deployment_key, deployment.into());
-                    self.save(checkpoint)?;
-                }
-                Err(TargetError::Config(detail)) if detail.contains("cloudflare.input.unbound") => {
-                    let report = report_for(
-                        &checkpoint.desired,
-                        ComponentDispositionKind::Reconciling,
-                        Vec::new(),
-                        vec![diagnostic("cloudflare.input.unbound", &detail)],
-                        None,
-                    );
-                    self.publish(checkpoint, report, false)?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    let report = report_for(
-                        &checkpoint.desired,
-                        ComponentDispositionKind::Reconciling,
-                        Vec::new(),
-                        vec![diagnostic(
-                            "cloudflare.target.unavailable",
-                            &error.to_string(),
-                        )],
-                        None,
-                    );
-                    self.publish(checkpoint, report, false)?;
-                    let delay = self.next_reconcile_delay(graph_id).await;
-                    tracing::warn!(
-                        graph_id = %hex::encode(graph_id),
-                        sequence = expected_sequence,
-                        ?delay,
-                        error = %error,
-                        "Cloudflare target operation failed; reconciliation backing off"
-                    );
-                    self.schedule(graph_id, expected_sequence, delay);
-                    return Ok(());
-                }
-            }
-            self.schedule(graph_id, expected_sequence, Duration::ZERO);
-            return Ok(());
-        }
-        checkpoint.phase = Phase::Ready;
-        let outputs = ready_outputs(&checkpoint.desired, &checkpoint.deployments)?;
-        let evidence = PublicationEvidence::default()
-            .with_revision(format!("generation:{}", checkpoint.desired.generation))
-            .with_uri("cloudflare://workers/deployments");
-        let report = report_for(
-            &checkpoint.desired,
-            ComponentDispositionKind::Ready,
-            outputs,
-            Vec::new(),
-            Some(evidence),
-        );
-        self.publish(checkpoint, report, true)
-    }
-
-    async fn facts(&self) -> Result<AccountFacts, TargetError> {
-        let mut facts = self.account_facts.lock().await;
-        if let Some(value) = facts.clone() {
-            return Ok(value);
-        }
-        let value = self.target.account_facts().await?;
-        *facts = Some(value.clone());
-        Ok(value)
-    }
-
-    async fn next_reconcile_delay(&self, graph_id: [u8; 16]) -> Duration {
-        self.reconcile_backoffs
-            .lock()
-            .await
-            .entry(graph_id)
-            .or_insert_with(|| Backoff::new(Duration::from_secs(1), Duration::from_mins(2)))
-            .next(None)
-    }
-
-    async fn reset_reconcile_backoff(&self, graph_id: [u8; 16]) {
-        self.reconcile_backoffs.lock().await.remove(&graph_id);
-    }
-
-    fn publish(
-        self: &Arc<Self>,
-        checkpoint: &mut Checkpoint,
-        report: SliceReport,
-        stable: bool,
-    ) -> Result<(), ReconcileError> {
-        let publication_id = stable
-            .then(|| publication_id(&checkpoint.desired, &report))
-            .flatten();
-        let snapshot = ReportSnapshot {
-            request_id: Uuid::now_v7().as_bytes().to_vec(),
-            publication_id,
-            report,
-        };
-        checkpoint.pending_report = Some(snapshot.clone());
-        self.save(checkpoint)?;
-        self.retry_report(checkpoint.desired.graph_id, snapshot);
-        Ok(())
-    }
-
-    fn retry_report(self: &Arc<Self>, graph_id: [u8; 16], snapshot: ReportSnapshot) {
-        let reconciler = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_mins(2));
-            loop {
-                let Ok(Some(current)) = reconciler.load(graph_id) else {
-                    return;
-                };
-                if current
-                    .pending_report
-                    .as_ref()
-                    .map(|value| &value.request_id)
-                    != Some(&snapshot.request_id)
-                {
-                    return;
-                }
-                let request = ReportSliceRequest {
-                    request_id: Some(snapshot.request_id.clone()),
-                    report: MessageField::some(snapshot.report.clone()),
-                    publication_id: snapshot.publication_id.clone(),
-                    ..Default::default()
-                };
-                match reconciler.reporter.report(request).await {
-                    Ok(()) => {
-                        let lock = reconciler.graph_lock(graph_id).await;
-                        let guard = lock.lock().await;
-                        let mut resume = None;
-                        if let Ok(Some(mut current)) = reconciler.load(graph_id)
-                            && current
-                                .pending_report
-                                .as_ref()
-                                .map(|value| &value.request_id)
-                                == Some(&snapshot.request_id)
-                        {
-                            current.pending_report = None;
-                            if !snapshot.report.outputs.is_empty() {
-                                resume = Some(current.desired.sequence);
-                            }
-                            let _ = reconciler.save(&current);
-                        }
-                        drop(guard);
-                        if let Some(sequence) = resume {
-                            reconciler.schedule(graph_id, sequence, Duration::ZERO);
-                        }
-                        return;
-                    }
-                    Err(ReportError::Terminal(error)) => {
-                        let lock = reconciler.graph_lock(graph_id).await;
-                        let _guard = lock.lock().await;
-                        if let Ok(Some(mut current)) = reconciler.load(graph_id)
-                            && current
-                                .pending_report
-                                .as_ref()
-                                .map(|value| &value.request_id)
-                                == Some(&snapshot.request_id)
-                        {
-                            current.pending_report = None;
-                            current.retired = true;
-                            let _ = reconciler.save(&current);
-                            tracing::warn!(
-                                graph_id = %hex::encode(graph_id),
-                                sequence = snapshot.report.sequence.unwrap_or_default(),
-                                error = %error,
-                                "core permanently rejected Cloudflare graph report; checkpoint tombstoned"
-                            );
-                        }
-                        return;
-                    }
-                    Err(ReportError::Retryable(error)) => {
-                        let delay = backoff.next(None);
-                        tracing::warn!(
-                            graph_id = %hex::encode(graph_id),
-                            sequence = snapshot.report.sequence.unwrap_or_default(),
-                            ?delay,
-                            error = %error,
-                            "Cloudflare report delivery failed; backing off"
-                        );
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        });
-    }
-
-    fn schedule(self: &Arc<Self>, graph_id: [u8; 16], sequence: u64, delay: Duration) {
-        let reconciler = Arc::clone(self);
-        tokio::spawn(async move {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            if let Err(error) = reconciler.clone().reconcile_once(graph_id, sequence).await {
-                let delay = reconciler.next_reconcile_delay(graph_id).await;
-                tracing::warn!(
-                    graph_id = %hex::encode(graph_id),
-                    sequence,
-                    ?delay,
-                    error = %error,
-                    "Cloudflare reconciliation pass failed; backing off"
-                );
-                reconciler.schedule(graph_id, sequence, delay);
-            }
-        });
-    }
-
-    async fn graph_lock(&self, graph_id: [u8; 16]) -> Arc<Mutex<()>> {
-        if let Some(lock) = self.graph_locks.read().await.get(&graph_id) {
-            return Arc::clone(lock);
-        }
-        Arc::clone(
-            self.graph_locks
-                .write()
-                .await
-                .entry(graph_id)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    }
-
-    fn path(&self, graph_id: [u8; 16]) -> PathBuf {
-        self.config
-            .state_dir
-            .join("graphs")
-            .join(format!("{}.json", hex::encode(graph_id)))
-    }
-
-    fn load(&self, graph_id: [u8; 16]) -> Result<Option<Checkpoint>, ReconcileError> {
-        let path = self.path(graph_id);
-        match fs::read(&path) {
-            Ok(_) => Self::load_path(&path).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(state(error)),
-        }
-    }
-
-    fn load_path(path: &PathBuf) -> Result<Checkpoint, ReconcileError> {
-        let envelope: CheckpointEnvelope =
-            serde_json::from_slice(&fs::read(path).map_err(state)?).map_err(state)?;
-        if envelope.version != CHECKPOINT_VERSION {
-            return Err(ReconcileError::State(format!(
-                "unsupported checkpoint version {}",
-                envelope.version
-            )));
-        }
-        Ok(envelope.state)
-    }
-
-    fn save(&self, checkpoint: &Checkpoint) -> Result<(), ReconcileError> {
-        let path = self.path(checkpoint.desired.graph_id);
-        let parent = path
-            .parent()
-            .ok_or_else(|| ReconcileError::State("checkpoint has no parent".into()))?;
-        let mut temporary = NamedTempFile::new_in(parent).map_err(state)?;
-        temporary
-            .write_all(
-                &serde_json::to_vec_pretty(&CheckpointEnvelope {
-                    version: CHECKPOINT_VERSION,
-                    state: checkpoint.clone(),
-                })
-                .map_err(state)?,
-            )
-            .map_err(state)?;
-        temporary.as_file_mut().sync_all().map_err(state)?;
-        temporary
-            .persist(&path)
-            .map_err(|error| state(error.error))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(state)?;
-        Ok(())
-    }
-}
-
-impl From<Deployment> for DeploymentSnapshot {
-    fn from(value: Deployment) -> Self {
-        Self {
-            url: value.url,
-            deployment_id: value.deployment_id,
-            version_id: value.version_id,
-            claim_url: value.claim_url,
-        }
-    }
-}
-
-fn workers_subdomain(url: &str) -> Option<String> {
-    let host = url.strip_prefix("https://")?.split('/').next()?;
-    host.strip_suffix(".workers.dev")?
-        .split_once('.')
-        .map(|(_, subdomain)| subdomain.to_owned())
-}
-
-fn plan_outputs(
-    desired: &DesiredSlice,
-    facts: &AccountFacts,
-) -> Result<Vec<ComponentOutputs>, ReconcileError> {
-    desired
+                .map(|slot| slot.key.clone())
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "action": operation.action,
+                "workerName": operation.worker_name,
+                "vars": vars,
+                "componentSpecHash": hex::encode(operation.component.spec_hash),
+            })
+        })
+        .collect::<Vec<_>>();
+    let planned_outputs = desired
         .components
         .iter()
         .map(|component| {
-            let resource_name = component
-                .context
-                .deployed_name()
-                .map_err(|error| ReconcileError::State(error.to_string()))?;
-            let value = if let Some(tunnel) = &component.context.tunnel {
-                serde_json::json!({
-                    "tunnelName": resource_name,
-                    "privateHostname": format!("{}:{}", tunnel.origin_host, tunnel.origin_port),
-                    "capability": "cloudflare-tunnel-api-pending"
-                })
-            } else {
-                serde_json::json!({
-                    "url": format!("https://{resource_name}.{}.workers.dev", facts.subdomain),
-                    "workerName": resource_name
-                })
-            };
-            output(component.spec_hash, &value)
+            let worker_name = component.context.deployed_name().unwrap_or_default();
+            let url = (!facts.subdomain.is_empty() && !component.context.is_tunnel())
+                .then(|| format!("https://{worker_name}.{}.workers.dev", facts.subdomain));
+            serde_json::json!({
+                "componentSpecHash": hex::encode(component.spec_hash),
+                "workerName": worker_name,
+                "url": url,
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let markdown_operations = plan
+        .operations
+        .iter()
+        .map(|operation| {
+            format!(
+                "- **{:?}** `{}` (vars: {})",
+                operation.action,
+                operation.worker_name,
+                operation
+                    .component
+                    .context
+                    .slots
+                    .iter()
+                    .map(|slot| slot.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    ReviewProjection {
+        json: serde_json::json!({
+            "desiredDigest": plan.desired_digest,
+            "operations": operations,
+            "plannedOutputs": planned_outputs,
+        }),
+        markdown: format!("# Cloudflare plan\n\n{markdown_operations}"),
+    }
+}
+
+fn blocked_markdown(blocked: &[BlockedInput]) -> String {
+    let items = blocked
+        .iter()
+        .map(|input| {
+            format!(
+                "- `{}` waits on `{}.{}`",
+                input.path, input.producer, input.output
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("# Cloudflare plan\n\nBlocked inputs:\n\n{items}")
 }
 
 fn ready_outputs(
     desired: &DesiredSlice,
-    deployments: &HashMap<String, DeploymentSnapshot>,
-) -> Result<Vec<ComponentOutputs>, ReconcileError> {
+    deployments: &BTreeMap<[u8; 32], Deployment>,
+) -> Result<Vec<Output>, String> {
     desired
         .components
         .iter()
         .map(|component| {
             let deployment = deployments
-                .get(&desired.deployment_key(component))
-                .ok_or_else(|| ReconcileError::State("ready deployment missing".into()))?;
-            let resource_name = component
+                .get(&component.spec_hash)
+                .ok_or_else(|| format!("deployment missing for component {:?}", component.name))?;
+            let worker_name = component
                 .context
                 .deployed_name()
-                .map_err(|error| ReconcileError::State(error.to_string()))?;
-            let mut value = if let Some(tunnel) = &component.context.tunnel {
+                .map_err(|error| error.to_string())?;
+            let mut values = if let Some(tunnel) = &component.context.tunnel {
                 serde_json::json!({
                     "tunnelId": deployment.deployment_id,
-                    "tunnelName": resource_name,
+                    "tunnelName": worker_name,
                     "privateHostname": format!("{}:{}", tunnel.origin_host, tunnel.origin_port),
                     "tokenRef": "connector-volume://henosis-tunnel/token",
-                    "capability": deployment.version_id
+                    "capability": deployment.version_id,
                 })
             } else {
                 serde_json::json!({
                     "url": deployment.url,
-                    "workerName": resource_name,
+                    "workerName": worker_name,
                     "deploymentId": deployment.deployment_id,
-                    "versionId": deployment.version_id
+                    "versionId": deployment.version_id,
                 })
             };
             if let Some(claim_url) = &deployment.claim_url {
-                value["claimUrl"] = serde_json::Value::String(claim_url.clone());
+                values["claimUrl"] = serde_json::Value::String(claim_url.clone());
             }
-            output(component.spec_hash, &value)
+            Ok(Output {
+                component_spec_hash: component.spec_hash,
+                values,
+            })
         })
         .collect()
 }
 
-fn output(hash: [u8; 32], value: &serde_json::Value) -> Result<ComponentOutputs, ReconcileError> {
-    Ok(ComponentOutputs::default()
-        .with_component_spec_hash(hash.to_vec())
-        .with_values_json(serde_json::to_vec(&value).map_err(state)?))
-}
-
-fn report_for(
-    desired: &DesiredSlice,
-    kind: ComponentDispositionKind,
-    outputs: Vec<ComponentOutputs>,
-    diagnostics: Vec<Diagnostic>,
-    publication: Option<PublicationEvidence>,
-) -> SliceReport {
-    let mut report = SliceReport {
-        graph_id: Some(desired.graph_id.to_vec()),
-        generation: Some(desired.generation),
-        connector: Some(crate::CONNECTOR_NAME.into()),
-        dispositions: desired
-            .components
-            .iter()
-            .map(|component| {
-                ComponentDisposition::default()
-                    .with_component_spec_hash(component.spec_hash.to_vec())
-                    .with_kind(kind)
-            })
-            .collect(),
-        outputs,
-        diagnostics,
-        sequence: Some(desired.sequence),
-        ..Default::default()
-    };
-    if let Some(publication) = publication {
-        report.publication = MessageField::some(publication);
+fn declarative_review(status: &str, phase: &str, detail: &str) -> ReviewProjection {
+    ReviewProjection {
+        json: serde_json::json!({"status": status, "phase": phase, "detail": detail}),
+        markdown: format!("# Cloudflare plan\n\n**Status:** {status}\n\n{detail}"),
     }
-    report
 }
 
-fn diagnostic(code: &str, message: &str) -> Diagnostic {
-    Diagnostic::default()
-        .with_code(code)
-        .with_message(message)
-        .with_severity(DiagnosticSeverity::Info)
-}
-
-fn publication_id(desired: &DesiredSlice, report: &SliceReport) -> Option<Vec<u8>> {
-    if report.outputs.is_empty() {
-        return None;
+fn failed_plan(phase: &str, detail: String) -> PlanOutcome<CloudflarePlan> {
+    PlanOutcome::Failed {
+        proposal: PlanProposal::declarative(declarative_review("failed", phase, &detail)),
+        diagnostics: vec![Diagnostic::error("cloudflare.plan.invalid", detail)],
     }
-    let bytes = serde_json::to_vec(&(
-        desired.graph_id,
-        desired.generation,
-        crate::CONNECTOR_NAME,
-        report
-            .outputs
-            .iter()
-            .map(|output| (&output.component_spec_hash, &output.values_json))
-            .collect::<Vec<_>>(),
-    ))
-    .expect("publication identity serializes");
-    Some(
-        Uuid::new_v5(&PUBLICATION_NAMESPACE, &bytes)
-            .as_bytes()
-            .to_vec(),
-    )
 }
 
-fn state(error: impl std::fmt::Display) -> ReconcileError {
-    ReconcileError::State(error.to_string())
+fn blocked_target_plan(phase: &str, error: &TargetError) -> PlanOutcome<CloudflarePlan> {
+    let detail = error.to_string();
+    PlanOutcome::Waiting {
+        proposal: PlanProposal::declarative(declarative_review("blocked", phase, &detail)),
+        diagnostics: vec![Diagnostic::warning("cloudflare.target.unavailable", detail)],
+        retry: Retry::after(Duration::from_secs(2)),
+    }
 }
-fn target_state(error: &TargetError) -> ReconcileError {
-    ReconcileError::State(error.to_string())
+
+fn target_waiting(error: &TargetError) -> ApplyOutcome {
+    ApplyOutcome::Waiting {
+        diagnostics: vec![Diagnostic::warning(
+            "cloudflare.target.unavailable",
+            error.to_string(),
+        )],
+        retry: Retry::after(Duration::from_secs(2)),
+    }
+}
+
+fn target_failure(error: &TargetError) -> ApplyOutcome {
+    match error {
+        TargetError::Config(detail) => ApplyOutcome::Failed(vec![Diagnostic::error(
+            "cloudflare.target.config",
+            detail.clone(),
+        )]),
+        TargetError::Provider(_) | TargetError::Stage(_) => target_waiting(error),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use iddqd::IdOrdMap;
 
-    #[test]
-    fn failed_precondition_report_rejection_is_terminal() {
-        let error = ReportError::from_connect(&connectrpc::ConnectError::new(
-            ErrorCode::FailedPrecondition,
-            "operation failed a graph precondition",
-        ));
-        assert!(matches!(error, ReportError::Terminal(_)));
+    use super::*;
+    use crate::context::API_VERSION;
+    use crate::context::ComponentContext;
+    use crate::context::InputSlot;
+    use crate::context::ProjectFile;
+    use crate::slice::UpstreamOutput;
+    use crate::target::TargetConfig;
+
+    fn connector() -> CloudflareConnector {
+        CloudflareConnector::new(Target::new(TargetConfig {
+            wrangler: "wrangler".into(),
+            account_id: None,
+            api_token: None,
+            wrangler_config: None,
+            account_subdomain: Some("example".into()),
+            secret_root: "/run/secrets".into(),
+            api_base: "https://api.cloudflare.test".into(),
+            tunnel_token_file: "/tmp/token".into(),
+        }))
+    }
+
+    fn component(hash: u8, name: &str, slots: Vec<InputSlot>) -> ComponentPin {
+        ComponentPin {
+            spec_hash: [hash; 32],
+            name: name.into(),
+            context: ComponentContext {
+                api_version: API_VERSION.into(),
+                worker_name: name.into(),
+                entry: "src/index.js".into(),
+                assets_directory: None,
+                environment: "dev".into(),
+                files: vec![ProjectFile {
+                    path: "src/index.js".into(),
+                    bytes: b"export default {}".to_vec(),
+                }],
+                slots,
+                tunnel: None,
+            },
+        }
+    }
+
+    fn desired(component: ComponentPin, outputs: Vec<UpstreamOutput>) -> DesiredSlice {
+        DesiredSlice {
+            graph_id: [9; 16],
+            generation: 2,
+            sequence: 3,
+            components: IdOrdMap::from_iter_unique([component]).unwrap(),
+            upstream_outputs: IdOrdMap::from_iter_unique(outputs).unwrap(),
+            removed_components: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_declares_worker_mutation_vars_and_apply_time_unknowns() {
+        let slot = InputSlot {
+            key: "BACKEND_URL".into(),
+            producer: "api".into(),
+            output: "url".into(),
+            producer_spec_hash: [4; 32],
+        };
+        let desired = desired(
+            component(5, "web", vec![slot]),
+            vec![UpstreamOutput {
+                component_spec_hash: [4; 32],
+                values_json: serde_json::to_vec(&serde_json::json!({"url":"https://api"})).unwrap(),
+            }],
+        );
+        let outcome = connector()
+            .plan(
+                PassContext {
+                    connector: crate::CONNECTOR_NAME,
+                    graph_id: desired.graph_id,
+                    generation: desired.generation,
+                    sequence: desired.sequence,
+                    idempotency_key: "test",
+                },
+                &desired,
+                &Observation {
+                    facts: AccountFacts {
+                        subdomain: "example".into(),
+                    },
+                    existing_workers: BTreeSet::new(),
+                },
+            )
+            .await;
+        let PlanOutcome::Apply(proposal) = outcome else {
+            panic!("expected apply plan")
+        };
+        assert!(proposal.plan.is_some());
+        assert!(
+            proposal
+                .unknown_slots
+                .iter()
+                .any(|slot| slot.path.ends_with("/deploymentId"))
+        );
+        assert_eq!(proposal.review.json["operations"][0]["action"], "create");
+        assert_eq!(
+            proposal.review.json["operations"][0]["vars"][0],
+            "BACKEND_URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_producer_value_is_a_durable_blocked_plan() {
+        let desired = desired(
+            component(
+                5,
+                "web",
+                vec![InputSlot {
+                    key: "BACKEND_URL".into(),
+                    producer: "api".into(),
+                    output: "url".into(),
+                    producer_spec_hash: [4; 32],
+                }],
+            ),
+            Vec::new(),
+        );
+        let outcome = connector()
+            .plan(
+                PassContext {
+                    connector: crate::CONNECTOR_NAME,
+                    graph_id: desired.graph_id,
+                    generation: desired.generation,
+                    sequence: desired.sequence,
+                    idempotency_key: "test",
+                },
+                &desired,
+                &Observation {
+                    facts: AccountFacts {
+                        subdomain: "example".into(),
+                    },
+                    existing_workers: BTreeSet::new(),
+                },
+            )
+            .await;
+        let PlanOutcome::Waiting { proposal, .. } = outcome else {
+            panic!("expected blocked plan")
+        };
+        assert_eq!(proposal.blocked_on_inputs.len(), 1);
+        assert_eq!(proposal.blocked_on_inputs[0].output, "url");
+        assert!(proposal.plan.is_none());
     }
 
     #[test]
-    fn unavailable_report_failure_is_retryable() {
-        let error = ReportError::from_connect(&connectrpc::ConnectError::new(
-            ErrorCode::Unavailable,
-            "core restarting",
-        ));
-        assert!(matches!(error, ReportError::Retryable(_)));
+    fn transition_carries_removed_workers_into_delete_plan_context() {
+        let prior = desired(component(1, "old-worker", Vec::new()), Vec::new());
+        let mut next = desired(component(2, "new-worker", Vec::new()), Vec::new());
+        connector()
+            .prepare_transition(
+                &TargetSlice {
+                    graph_id: prior.graph_id,
+                    generation: 1,
+                    sequence: 1,
+                    connector: crate::CONNECTOR_NAME.into(),
+                    components: Vec::new(),
+                    upstream_outputs: Vec::new(),
+                    superseded_components: Vec::new(),
+                },
+                &prior,
+                &TargetSlice {
+                    graph_id: next.graph_id,
+                    generation: 2,
+                    sequence: 2,
+                    connector: crate::CONNECTOR_NAME.into(),
+                    components: Vec::new(),
+                    upstream_outputs: Vec::new(),
+                    superseded_components: Vec::new(),
+                },
+                &mut next,
+            )
+            .unwrap();
+        assert_eq!(next.removed_components[0].context.worker_name, "old-worker");
     }
 }

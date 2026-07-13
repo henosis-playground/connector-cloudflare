@@ -304,7 +304,8 @@ impl Target {
         })?;
         let token = self.account_token()?.ok_or_else(|| {
             TargetError::Config(
-                "Cloudflare API token or Wrangler OAuth credentials are required for Tunnel resources"
+                "Cloudflare API token or Wrangler OAuth credentials are required for Tunnel \
+                 resources"
                     .into(),
             )
         })?;
@@ -475,6 +476,33 @@ impl Target {
         }
     }
 
+    /// Whether a Worker deployment currently exists.
+    pub async fn worker_exists(&self, worker_name: &str) -> Result<bool, TargetError> {
+        let output = match self
+            .run_wrangler(
+                None,
+                &[
+                    "deployments".into(),
+                    "list".into(),
+                    "--name".into(),
+                    worker_name.into(),
+                    "--json".into(),
+                ],
+                None,
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(TargetError::Provider(detail)) if missing_resource(&detail) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let deployments: Vec<WranglerDeployment> =
+            serde_json::from_slice(&output.stdout).map_err(|error| {
+                TargetError::Provider(format!("invalid Wrangler deployment JSON: {error}"))
+            })?;
+        Ok(!deployments.is_empty())
+    }
+
     async fn deployment_identity(
         &self,
         worker_name: &str,
@@ -517,19 +545,32 @@ impl Target {
             .context
             .deployed_name()
             .map_err(|error| TargetError::Config(error.to_string()))?;
-        self.run_wrangler(
-            None,
-            &[
-                "delete".into(),
-                "--name".into(),
-                worker_name,
-                "--force".into(),
-            ],
-            None,
-        )
-        .await
-        .map(|_| ())
+        match self
+            .run_wrangler(
+                None,
+                &[
+                    "delete".into(),
+                    "--name".into(),
+                    worker_name,
+                    "--force".into(),
+                ],
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(TargetError::Provider(detail)) if missing_resource(&detail) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn missing_resource(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("not found")
+        || detail.contains("does not exist")
+        || detail.contains("no deployment")
+        || detail.contains("code: 10090")
 }
 
 fn retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
@@ -737,6 +778,7 @@ mod tests {
             sequence: 1,
             components: IdOrdMap::new(),
             upstream_outputs: IdOrdMap::<UpstreamOutput>::new(),
+            removed_components: Vec::new(),
         };
         let error = resolve_bindings(
             &desired,
@@ -796,6 +838,7 @@ mod tests {
             sequence: 1,
             components,
             upstream_outputs: IdOrdMap::<UpstreamOutput>::new(),
+            removed_components: Vec::new(),
         };
         let bindings = resolve_bindings(
             &desired,

@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+async-trait = "0.1.89"
 axum = "0.8.4"
 base64 = "0.22.1"
 blake3 = "1.8.2"
@@ -30,6 +31,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 uuid = { version = "1.17.0", features = ["v5", "v7"] }
 walkdir = "2.5.0"
 
+connector-sdk = { git = "https://github.com/henosis-playground/connector-sdk.git", branch = "feat/explicit-plans" }
 henosis-proto = { git = "https://github.com/henosis-playground/core.git", rev = "d3d9b98cc185fbc2b8e46e2ccdc38306e0665076" }
 henosis-cloudflare-reconciler = { path = "crates/reconciler" }
 henosis-cloudflare-authoring = { path = "crates/authoring" }
