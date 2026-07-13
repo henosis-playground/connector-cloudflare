@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "services/*"]
+
+[workspace.package]
+repository = "https://github.com/henosis-playground/connector-cloudflare"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+axum = "0.8.4"
+blake3 = "1.8.2"
+buffa = "0.8.1"
+connectrpc = { version = "0.8.1", features = ["axum", "client", "server"] }
+hex = "0.4.3"
+http = "1.3.1"
+iddqd = { version = "0.4.5", features = ["serde"] }
+reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.20.0"
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9.5"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+uuid = { version = "1.17.0", features = ["v5", "v7"] }
+walkdir = "2.5.0"
+
+henosis-proto = { git = "https://github.com/henosis-playground/core.git", rev = "d3d9b98cc185fbc2b8e46e2ccdc38306e0665076" }
+henosis-cloudflare-reconciler = { path = "crates/reconciler" }
+henosis-cloudflare-authoring = { path = "crates/authoring" }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
+panic = "abort"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = 3
+strip = true
+panic = "abort"
+codegen-units = 1
+lto = true

@@ -1,0 +1,19 @@
+[package]
+name = "henosis-cloudflare-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+connectrpc.workspace = true
+http.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+henosis-cloudflare-reconciler.workspace = true
+
+[lints]
+workspace = true
