@@ -6,10 +6,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use base64::Engine as _;
 use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
+use uuid::Uuid;
 
 use crate::slice::ComponentPin;
 use crate::slice::DesiredSlice;
@@ -27,6 +30,10 @@ pub struct TargetConfig {
     pub account_subdomain: Option<String>,
     /// Directory containing connector-resolvable secret refs.
     pub secret_root: PathBuf,
+    /// Cloudflare REST API root, overridable for contract tests.
+    pub api_base: String,
+    /// Shared file consumed by the benchmark cloudflared service.
+    pub tunnel_token_file: PathBuf,
 }
 
 /// Plan-time account facts.
@@ -91,6 +98,31 @@ struct WranglerVersion {
     version_id: String,
 }
 
+#[derive(Deserialize)]
+struct TunnelEnvelope<T> {
+    success: bool,
+    result: Option<T>,
+    #[serde(default)]
+    errors: Vec<TunnelApiError>,
+}
+
+#[derive(Deserialize)]
+struct TunnelApiError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct TunnelResult {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct CreateTunnelRequest<'a> {
+    name: &'a str,
+    tunnel_secret: &'a str,
+}
+
 impl Target {
     /// Construct an adapter.
     #[must_use]
@@ -121,7 +153,8 @@ impl Target {
         let response = self
             .client
             .get(format!(
-                "https://api.cloudflare.com/client/v4/accounts/{account}/workers/subdomain"
+                "{}/accounts/{account}/workers/subdomain",
+                self.config.api_base
             ))
             .bearer_auth(token)
             .send()
@@ -150,14 +183,18 @@ impl Target {
         component: &ComponentPin,
         facts: &AccountFacts,
     ) -> Result<Deployment, TargetError> {
+        if component.context.is_tunnel() {
+            return self.deploy_tunnel(component).await;
+        }
         let directory =
             tempfile::tempdir().map_err(|error| TargetError::Stage(error.to_string()))?;
         stage(&component.context.files, directory.path())?;
+        sanitize_symbolic_vars(component, directory.path())?;
         let worker_name = component
             .context
             .deployed_name()
             .map_err(|error| TargetError::Config(error.to_string()))?;
-        let bindings = resolve_bindings(desired, component, &self.config.secret_root)?;
+        let bindings = resolve_bindings(desired, component, facts, &self.config.secret_root)?;
         let mut command = Command::new(&self.config.wrangler);
         command
             .current_dir(directory.path())
@@ -236,6 +273,91 @@ impl Target {
         })
     }
 
+    async fn deploy_tunnel(&self, component: &ComponentPin) -> Result<Deployment, TargetError> {
+        let account = self.config.account_id.as_ref().ok_or_else(|| {
+            TargetError::Config("CLOUDFLARE_ACCOUNT_ID is required for Tunnel resources".into())
+        })?;
+        let token = self.config.api_token.as_ref().ok_or_else(|| {
+            TargetError::Config("CLOUDFLARE_API_TOKEN is required for Tunnel resources".into())
+        })?;
+        let tunnel = component
+            .context
+            .tunnel
+            .as_ref()
+            .ok_or_else(|| TargetError::Config("Tunnel context is missing".into()))?;
+        let name = component
+            .context
+            .deployed_name()
+            .map_err(|error| TargetError::Config(error.to_string()))?;
+        let mut secret = Vec::with_capacity(32);
+        secret.extend_from_slice(Uuid::now_v7().as_bytes());
+        secret.extend_from_slice(Uuid::now_v7().as_bytes());
+        let secret = base64::engine::general_purpose::STANDARD.encode(secret);
+        let response = self
+            .client
+            .post(format!(
+                "{}/accounts/{account}/cfd_tunnel",
+                self.config.api_base
+            ))
+            .bearer_auth(token)
+            .json(&CreateTunnelRequest {
+                name: &name,
+                tunnel_secret: &secret,
+            })
+            .send()
+            .await
+            .map_err(|error| TargetError::Provider(error.to_string()))?;
+        let status = response.status();
+        let envelope: TunnelEnvelope<TunnelResult> = response
+            .json()
+            .await
+            .map_err(|error| TargetError::Provider(error.to_string()))?;
+        if !status.is_success() || !envelope.success {
+            return Err(TargetError::Provider(format!(
+                "Tunnel create API returned {status}: {}",
+                tunnel_errors(&envelope.errors)
+            )));
+        }
+        let created = envelope
+            .result
+            .ok_or_else(|| TargetError::Provider("Tunnel create API returned no result".into()))?;
+        let token_response = self
+            .client
+            .get(format!(
+                "{}/accounts/{account}/cfd_tunnel/{}/token",
+                self.config.api_base, created.id
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| TargetError::Provider(error.to_string()))?;
+        let token_status = token_response.status();
+        let token_envelope: TunnelEnvelope<String> = token_response
+            .json()
+            .await
+            .map_err(|error| TargetError::Provider(error.to_string()))?;
+        if !token_status.is_success() || !token_envelope.success {
+            return Err(TargetError::Provider(format!(
+                "Tunnel token API returned {token_status}: {}",
+                tunnel_errors(&token_envelope.errors)
+            )));
+        }
+        let tunnel_token = token_envelope
+            .result
+            .ok_or_else(|| TargetError::Provider("Tunnel token API returned no result".into()))?;
+        if let Some(parent) = self.config.tunnel_token_file.parent() {
+            fs::create_dir_all(parent).map_err(|error| TargetError::Stage(error.to_string()))?;
+        }
+        fs::write(&self.config.tunnel_token_file, tunnel_token)
+            .map_err(|error| TargetError::Stage(error.to_string()))?;
+        Ok(Deployment {
+            url: format!("http://{}:{}", tunnel.origin_host, tunnel.origin_port),
+            deployment_id: created.id,
+            version_id: "workers-vpc-tunnel-v1".into(),
+            claim_url: None,
+        })
+    }
+
     async fn deployment_identity(
         &self,
         worker_name: &str,
@@ -278,6 +400,11 @@ impl Target {
 
     /// Delete a deployed Worker.
     pub async fn delete(&self, component: &ComponentPin) -> Result<(), TargetError> {
+        if component.context.is_tunnel() {
+            return Err(TargetError::Config(
+                "Tunnel retirement requires the retained provider tunnel id".into(),
+            ));
+        }
         let worker_name = component
             .context
             .deployed_name()
@@ -317,32 +444,13 @@ struct Bindings {
 fn resolve_bindings(
     desired: &DesiredSlice,
     component: &ComponentPin,
+    facts: &AccountFacts,
     secret_root: &Path,
 ) -> Result<Bindings, TargetError> {
     let mut plain = BTreeMap::new();
     let mut secrets = BTreeMap::new();
     for slot in &component.context.slots {
-        let output = desired
-            .upstream_outputs
-            .get(&slot.producer_spec_hash)
-            .ok_or_else(|| {
-                TargetError::Config(format!(
-                    "cloudflare.input.unbound: {} requires {}.{}",
-                    slot.key, slot.producer, slot.output
-                ))
-            })?;
-        let values: serde_json::Value = serde_json::from_slice(&output.values_json)
-            .map_err(|error| TargetError::Config(error.to_string()))?;
-        let value = values.get(&slot.output).ok_or_else(|| {
-            TargetError::Config(format!(
-                "cloudflare.input.unbound: {} requires {}.{}",
-                slot.key, slot.producer, slot.output
-            ))
-        })?;
-        let text = match value.as_str() {
-            Some(value) => value.to_owned(),
-            None => value.to_string(),
-        };
+        let text = resolve_slot(desired, slot, facts)?;
         if slot.output.ends_with("Ref") {
             secrets.insert(slot.key.clone(), resolve_secret_ref(&text, secret_root)?);
         } else {
@@ -350,6 +458,58 @@ fn resolve_bindings(
         }
     }
     Ok(Bindings { plain, secrets })
+}
+
+fn resolve_slot(
+    desired: &DesiredSlice,
+    slot: &crate::context::InputSlot,
+    facts: &AccountFacts,
+) -> Result<String, TargetError> {
+    if let Some(output) = desired.upstream_outputs.get(&slot.producer_spec_hash) {
+        let values: serde_json::Value = serde_json::from_slice(&output.values_json)
+            .map_err(|error| TargetError::Config(error.to_string()))?;
+        if let Some(value) = values.get(&slot.output) {
+            return Ok(match value.as_str() {
+                Some(value) => value.to_owned(),
+                None => value.to_string(),
+            });
+        }
+    }
+
+    if let Some(producer) = desired.components.get(&slot.producer_spec_hash) {
+        let worker_name = producer
+            .context
+            .deployed_name()
+            .map_err(|error| TargetError::Config(error.to_string()))?;
+        return match slot.output.as_str() {
+            "url" => Ok(format!(
+                "https://{worker_name}.{}.workers.dev",
+                facts.subdomain
+            )),
+            "workerName" => Ok(worker_name),
+            _ => Err(unbound(slot)),
+        };
+    }
+
+    Err(unbound(slot))
+}
+
+fn unbound(slot: &crate::context::InputSlot) -> TargetError {
+    TargetError::Config(format!(
+        "cloudflare.input.unbound: {} requires {}.{}",
+        slot.key, slot.producer, slot.output
+    ))
+}
+
+fn tunnel_errors(errors: &[TunnelApiError]) -> String {
+    if errors.is_empty() {
+        return "no structured error detail".into();
+    }
+    errors
+        .iter()
+        .map(|error| format!("{}: {}", error.code, error.message))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn resolve_secret_ref(reference: &str, secret_root: &Path) -> Result<String, TargetError> {
@@ -363,6 +523,25 @@ fn resolve_secret_ref(reference: &str, secret_root: &Path) -> Result<String, Tar
         .map_err(|error| {
             TargetError::Config(format!("cannot resolve secret ref {reference:?}: {error}"))
         })
+}
+
+fn sanitize_symbolic_vars(component: &ComponentPin, root: &Path) -> Result<(), TargetError> {
+    if component.context.slots.is_empty() {
+        return Ok(());
+    }
+    let path = root.join("wrangler.toml");
+    let source =
+        fs::read_to_string(&path).map_err(|error| TargetError::Stage(error.to_string()))?;
+    let mut config: toml::Value =
+        toml::from_str(&source).map_err(|error| TargetError::Stage(error.to_string()))?;
+    if let Some(vars) = config.get_mut("vars").and_then(toml::Value::as_table_mut) {
+        for slot in &component.context.slots {
+            vars.remove(&slot.key);
+        }
+    }
+    let source =
+        toml::to_string_pretty(&config).map_err(|error| TargetError::Stage(error.to_string()))?;
+    fs::write(path, source).map_err(|error| TargetError::Stage(error.to_string()))
 }
 
 fn stage(files: &[crate::context::ProjectFile], root: &Path) -> Result<(), TargetError> {
@@ -403,6 +582,7 @@ mod tests {
                     output: "restUrl".into(),
                     producer_spec_hash: [2; 32],
                 }],
+                tunnel: None,
             },
         };
         let desired = DesiredSlice {
@@ -412,10 +592,77 @@ mod tests {
             components: IdOrdMap::new(),
             upstream_outputs: IdOrdMap::<UpstreamOutput>::new(),
         };
-        let error = resolve_bindings(&desired, &component, Path::new("/run/secrets"))
-            .unwrap_err()
-            .to_string();
+        let error = resolve_bindings(
+            &desired,
+            &component,
+            &AccountFacts {
+                subdomain: "example".into(),
+            },
+            Path::new("/run/secrets"),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("cloudflare.input.unbound"));
         assert!(error.contains("db.restUrl"));
+    }
+
+    #[test]
+    fn resolves_plan_time_url_between_workers_in_one_slice() {
+        let producer = ComponentPin {
+            spec_hash: [2; 32],
+            name: "api".into(),
+            context: ComponentContext {
+                api_version: crate::context::API_VERSION.into(),
+                worker_name: "api".into(),
+                entry: "src/index.js".into(),
+                assets_directory: None,
+                environment: "dev".into(),
+                files: vec![],
+                slots: vec![],
+                tunnel: None,
+            },
+        };
+        let consumer = ComponentPin {
+            spec_hash: [3; 32],
+            name: "web".into(),
+            context: ComponentContext {
+                api_version: crate::context::API_VERSION.into(),
+                worker_name: "web".into(),
+                entry: "src/index.js".into(),
+                assets_directory: None,
+                environment: "dev".into(),
+                files: vec![],
+                slots: vec![InputSlot {
+                    key: "BACKEND_URL".into(),
+                    producer: "api".into(),
+                    output: "url".into(),
+                    producer_spec_hash: [2; 32],
+                }],
+                tunnel: None,
+            },
+        };
+        let mut components = IdOrdMap::new();
+        components.insert_unique(producer).unwrap();
+        components.insert_unique(consumer.clone()).unwrap();
+        let desired = DesiredSlice {
+            graph_id: [0; 16],
+            generation: 1,
+            sequence: 1,
+            components,
+            upstream_outputs: IdOrdMap::<UpstreamOutput>::new(),
+        };
+        let bindings = resolve_bindings(
+            &desired,
+            &consumer,
+            &AccountFacts {
+                subdomain: "example".into(),
+            },
+            Path::new("/run/secrets"),
+        )
+        .unwrap();
+        assert_eq!(
+            bindings.plain.get("BACKEND_URL").map(String::as_str),
+            Some("https://api-dev.example.workers.dev")
+        );
     }
 }

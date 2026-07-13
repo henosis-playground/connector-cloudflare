@@ -136,7 +136,7 @@ struct CheckpointEnvelope {
 struct Checkpoint {
     desired: DesiredSlice,
     phase: Phase,
-    deployments: HashMap<[u8; 32], DeploymentSnapshot>,
+    deployments: HashMap<String, DeploymentSnapshot>,
     pending_report: Option<ReportSnapshot>,
     retired: bool,
 }
@@ -191,7 +191,7 @@ impl Reconciler {
         let desired = DesiredSlice::from_request(request)?;
         let lock = self.graph_lock(desired.graph_id).await;
         let _guard = lock.lock().await;
-        if let Some(current) = self.load(desired.graph_id)? {
+        if let Some(mut current) = self.load(desired.graph_id)? {
             if current.retired {
                 return Err(ReconcileError::Retired);
             }
@@ -204,6 +204,14 @@ impl Reconciler {
                 }
                 self.schedule(desired.graph_id, desired.sequence, Duration::ZERO);
                 return Ok(desired.sequence);
+            }
+            if desired.target_digest() == current.desired.target_digest() {
+                let sequence = desired.sequence;
+                current.desired = desired;
+                current.pending_report = None;
+                self.save(&current)?;
+                self.schedule(current.desired.graph_id, sequence, Duration::ZERO);
+                return Ok(sequence);
             }
         }
         let sequence = desired.sequence;
@@ -292,21 +300,24 @@ impl Reconciler {
                 checkpoint.phase = Phase::Planned;
                 let report = report_for(
                     &checkpoint.desired,
-                    ComponentDispositionKind::Reconciling,
+                    ComponentDispositionKind::Ready,
                     outputs,
                     vec![diagnostic(
                         "cloudflare.plan.ready",
-                        "plan-time workers.dev URL published before deployment",
+                        "plan-time workers.dev URL published before deployment; the deployed core \
+                         contract requires publishable slices to use the ready disposition",
                     )],
                     None,
                 );
                 self.publish(&mut checkpoint, report, true)?;
-                self.schedule(graph_id, expected_sequence, Duration::ZERO);
             }
             Phase::Planned => {
                 let facts = self.facts().await.map_err(|error| target_state(&error))?;
-                for component in &checkpoint.desired.components {
-                    if checkpoint.deployments.contains_key(&component.spec_hash) {
+                let mut components = checkpoint.desired.components.iter().collect::<Vec<_>>();
+                components.sort_by_key(|component| component.context.is_tunnel());
+                for component in components {
+                    let deployment_key = hex::encode(component.spec_hash);
+                    if checkpoint.deployments.contains_key(&deployment_key) {
                         continue;
                     }
                     match self
@@ -317,7 +328,7 @@ impl Reconciler {
                         Ok(deployment) => {
                             checkpoint
                                 .deployments
-                                .insert(component.spec_hash, deployment.into());
+                                .insert(deployment_key, deployment.into());
                             self.save(&checkpoint)?;
                         }
                         Err(TargetError::Config(detail))
@@ -326,25 +337,25 @@ impl Reconciler {
                             let report = report_for(
                                 &checkpoint.desired,
                                 ComponentDispositionKind::Reconciling,
-                                plan_outputs(&checkpoint.desired, &facts)?,
+                                Vec::new(),
                                 vec![diagnostic("cloudflare.input.unbound", &detail)],
                                 None,
                             );
-                            self.publish(&mut checkpoint, report, true)?;
+                            self.publish(&mut checkpoint, report, false)?;
                             return Ok(());
                         }
                         Err(error) => {
                             let report = report_for(
                                 &checkpoint.desired,
                                 ComponentDispositionKind::Reconciling,
-                                plan_outputs(&checkpoint.desired, &facts)?,
+                                Vec::new(),
                                 vec![diagnostic(
                                     "cloudflare.target.unavailable",
                                     &error.to_string(),
                                 )],
                                 None,
                             );
-                            self.publish(&mut checkpoint, report, true)?;
+                            self.publish(&mut checkpoint, report, false)?;
                             self.schedule(graph_id, expected_sequence, Duration::from_secs(2));
                             return Ok(());
                         }
@@ -423,20 +434,38 @@ impl Reconciler {
                     publication_id: snapshot.publication_id.clone(),
                     ..Default::default()
                 };
-                if reconciler.reporter.report(request).await.is_ok() {
-                    let lock = reconciler.graph_lock(graph_id).await;
-                    let _guard = lock.lock().await;
-                    if let Ok(Some(mut current)) = reconciler.load(graph_id)
-                        && current
-                            .pending_report
-                            .as_ref()
-                            .map(|value| &value.request_id)
-                            == Some(&snapshot.request_id)
-                    {
-                        current.pending_report = None;
-                        let _ = reconciler.save(&current);
+                match reconciler.reporter.report(request).await {
+                    Ok(()) => {
+                        let lock = reconciler.graph_lock(graph_id).await;
+                        let guard = lock.lock().await;
+                        let mut resume = None;
+                        if let Ok(Some(mut current)) = reconciler.load(graph_id)
+                            && current
+                                .pending_report
+                                .as_ref()
+                                .map(|value| &value.request_id)
+                                == Some(&snapshot.request_id)
+                        {
+                            current.pending_report = None;
+                            if !snapshot.report.outputs.is_empty() {
+                                resume = Some(current.desired.sequence);
+                            }
+                            let _ = reconciler.save(&current);
+                        }
+                        drop(guard);
+                        if let Some(sequence) = resume {
+                            reconciler.schedule(graph_id, sequence, Duration::ZERO);
+                        }
+                        return;
                     }
-                    return;
+                    Err(error) => {
+                        tracing::warn!(
+                            graph_id = %hex::encode(graph_id),
+                            sequence = snapshot.report.sequence.unwrap_or_default(),
+                            error = %error,
+                            "cloudflare report delivery failed"
+                        );
+                    }
                 }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(30));
@@ -450,7 +479,14 @@ impl Reconciler {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            let _ = reconciler.reconcile_once(graph_id, sequence).await;
+            if let Err(error) = reconciler.reconcile_once(graph_id, sequence).await {
+                tracing::error!(
+                    graph_id = %hex::encode(graph_id),
+                    sequence,
+                    error = %error,
+                    "cloudflare reconciliation pass failed"
+                );
+            }
         });
     }
 
@@ -536,22 +572,68 @@ fn plan_outputs(
     desired: &DesiredSlice,
     facts: &AccountFacts,
 ) -> Result<Vec<ComponentOutputs>, ReconcileError> {
-    desired.components.iter().map(|component| {
-        let worker_name = component.context.deployed_name().map_err(|error| ReconcileError::State(error.to_string()))?;
-        output(component.spec_hash, &serde_json::json!({"url": format!("https://{worker_name}.{}.workers.dev", facts.subdomain), "workerName": worker_name}))
-    }).collect()
+    desired
+        .components
+        .iter()
+        .map(|component| {
+            let resource_name = component
+                .context
+                .deployed_name()
+                .map_err(|error| ReconcileError::State(error.to_string()))?;
+            let value = if let Some(tunnel) = &component.context.tunnel {
+                serde_json::json!({
+                    "tunnelName": resource_name,
+                    "privateHostname": format!("{}:{}", tunnel.origin_host, tunnel.origin_port),
+                    "capability": "cloudflare-tunnel-api-pending"
+                })
+            } else {
+                serde_json::json!({
+                    "url": format!("https://{resource_name}.{}.workers.dev", facts.subdomain),
+                    "workerName": resource_name
+                })
+            };
+            output(component.spec_hash, &value)
+        })
+        .collect()
 }
 
 fn ready_outputs(
     desired: &DesiredSlice,
-    deployments: &HashMap<[u8; 32], DeploymentSnapshot>,
+    deployments: &HashMap<String, DeploymentSnapshot>,
 ) -> Result<Vec<ComponentOutputs>, ReconcileError> {
-    desired.components.iter().map(|component| {
-        let deployment = deployments.get(&component.spec_hash).ok_or_else(|| ReconcileError::State("ready deployment missing".into()))?;
-        let mut value = serde_json::json!({"url": deployment.url, "workerName": component.context.deployed_name().map_err(|error| ReconcileError::State(error.to_string()))?, "deploymentId": deployment.deployment_id, "versionId": deployment.version_id});
-        if let Some(claim_url) = &deployment.claim_url { value["claimUrl"] = serde_json::Value::String(claim_url.clone()); }
-        output(component.spec_hash, &value)
-    }).collect()
+    desired
+        .components
+        .iter()
+        .map(|component| {
+            let deployment = deployments
+                .get(&hex::encode(component.spec_hash))
+                .ok_or_else(|| ReconcileError::State("ready deployment missing".into()))?;
+            let resource_name = component
+                .context
+                .deployed_name()
+                .map_err(|error| ReconcileError::State(error.to_string()))?;
+            let mut value = if let Some(tunnel) = &component.context.tunnel {
+                serde_json::json!({
+                    "tunnelId": deployment.deployment_id,
+                    "tunnelName": resource_name,
+                    "privateHostname": format!("{}:{}", tunnel.origin_host, tunnel.origin_port),
+                    "tokenRef": "connector-volume://henosis-tunnel/token",
+                    "capability": deployment.version_id
+                })
+            } else {
+                serde_json::json!({
+                    "url": deployment.url,
+                    "workerName": resource_name,
+                    "deploymentId": deployment.deployment_id,
+                    "versionId": deployment.version_id
+                })
+            };
+            if let Some(claim_url) = &deployment.claim_url {
+                value["claimUrl"] = serde_json::Value::String(claim_url.clone());
+            }
+            output(component.spec_hash, &value)
+        })
+        .collect()
 }
 
 fn output(hash: [u8; 32], value: &serde_json::Value) -> Result<ComponentOutputs, ReconcileError> {

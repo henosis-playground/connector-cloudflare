@@ -149,10 +149,23 @@ impl DesiredSlice {
         })
     }
 
-    /// Digest all desired target-affecting material.
+    /// Digest the complete delivered level, including its sequence identity.
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
         let bytes = serde_json::to_vec(self).expect("desired slice serializes");
+        *blake3::hash(&bytes).as_bytes()
+    }
+
+    /// Digest only material that can change a Cloudflare deployment.
+    #[must_use]
+    pub fn target_digest(&self) -> [u8; 32] {
+        let bytes = serde_json::to_vec(&(
+            self.graph_id,
+            self.generation,
+            &self.components,
+            &self.upstream_outputs,
+        ))
+        .expect("desired target material serializes");
         *blake3::hash(&bytes).as_bytes()
     }
 }

@@ -676,6 +676,7 @@ dependencies = [
 name = "henosis-cloudflare-reconciler"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "buffa",
  "connectrpc",
@@ -689,6 +690,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

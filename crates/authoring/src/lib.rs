@@ -10,6 +10,7 @@ use henosis_cloudflare_reconciler::context::API_VERSION;
 use henosis_cloudflare_reconciler::context::ComponentContext;
 use henosis_cloudflare_reconciler::context::InputSlot;
 use henosis_cloudflare_reconciler::context::ProjectFile;
+use henosis_cloudflare_reconciler::context::TunnelContext;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -165,6 +166,7 @@ pub fn derive_component(
         environment: environment.into(),
         files,
         slots,
+        tunnel: None,
     };
     ComponentContext::from_bytes(&serde_json::to_vec(&context).map_err(DeriveError::Serialize)?)
         .map_err(|source| DeriveError::Invalid {
@@ -186,6 +188,49 @@ pub fn derive_component(
             }
         }),
         depends_on: dependencies.values().map(|hash| hash.to_vec()).collect(),
+        connector_context: context,
+    })
+}
+
+/// Derive a private Tunnel resource without hiding its origin in a marker file.
+pub fn derive_tunnel(
+    name: &str,
+    environment: &str,
+    origin_host: &str,
+    origin_port: u16,
+) -> Result<DerivedComponent, DeriveError> {
+    let context = ComponentContext {
+        api_version: API_VERSION.into(),
+        worker_name: name.into(),
+        entry: String::new(),
+        assets_directory: None,
+        environment: environment.into(),
+        files: Vec::new(),
+        slots: Vec::new(),
+        tunnel: Some(TunnelContext {
+            origin_host: origin_host.into(),
+            origin_port,
+        }),
+    };
+    ComponentContext::from_bytes(&serde_json::to_vec(&context).map_err(DeriveError::Serialize)?)
+        .map_err(|source| DeriveError::Invalid {
+            path: PathBuf::from("<cloudflare-tunnel>"),
+            message: source.to_string(),
+        })?;
+    Ok(DerivedComponent {
+        name: name.into(),
+        connector: CONNECTOR_NAME.into(),
+        outputs_schema: serde_json::json!({
+            "kind": "object",
+            "shape": {
+                "tunnelId": {"kind": "string"},
+                "tunnelName": {"kind": "string"},
+                "privateHostname": {"kind": "string"},
+                "tokenRef": {"kind": "string"},
+                "capability": {"kind": "string"}
+            }
+        }),
+        depends_on: Vec::new(),
         connector_context: context,
     })
 }
@@ -248,5 +293,14 @@ mod tests {
         assert_eq!(derived.depends_on, vec![hash.to_vec()]);
         assert_eq!(derived.connector_context.slots[0].output, "restUrl");
         assert!(!root.path().join("henosis.toml").exists());
+    }
+
+    #[test]
+    fn derives_private_tunnel_resource() {
+        let derived = derive_tunnel("supabase-private", "dev", "supabase-kong", 8000).unwrap();
+        assert_eq!(derived.name, "supabase-private");
+        let tunnel = derived.connector_context.tunnel.unwrap();
+        assert_eq!(tunnel.origin_host, "supabase-kong");
+        assert_eq!(tunnel.origin_port, 8000);
     }
 }

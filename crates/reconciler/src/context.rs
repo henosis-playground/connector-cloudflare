@@ -25,6 +25,19 @@ pub struct ComponentContext {
     pub files: Vec<ProjectFile>,
     /// Runtime variable slots.
     pub slots: Vec<InputSlot>,
+    /// Named Tunnel resource instead of a Worker project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelContext>,
+}
+
+/// Private origin reached by a remotely managed Cloudflare Tunnel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TunnelContext {
+    /// Hostname resolvable from the cloudflared container.
+    pub origin_host: String,
+    /// HTTP port exposed by the private origin.
+    pub origin_port: u16,
 }
 
 /// One file copied from the native Worker project into the deployment boundary.
@@ -72,26 +85,50 @@ impl ComponentContext {
             )));
         }
         validate_dns_label(&value.worker_name)?;
-        if value.entry.starts_with('/') || value.entry.contains("..") {
-            return Err(ContextError::Invalid(
-                "entry must be a safe relative path".into(),
-            ));
-        }
-        if value.files.is_empty() {
-            return Err(ContextError::Invalid("files must not be empty".into()));
-        }
-        for file in &value.files {
-            if file.path.starts_with('/') || file.path.contains("..") {
-                return Err(ContextError::Invalid(format!(
-                    "project file path {:?} is unsafe",
-                    file.path
-                )));
+        if let Some(tunnel) = &value.tunnel {
+            if tunnel.origin_host.is_empty() || tunnel.origin_host.contains('/') {
+                return Err(ContextError::Invalid(
+                    "tunnel originHost must be a non-empty hostname".into(),
+                ));
+            }
+            if tunnel.origin_port == 0 {
+                return Err(ContextError::Invalid(
+                    "tunnel originPort must be greater than zero".into(),
+                ));
+            }
+            if !value.files.is_empty() || !value.entry.is_empty() || !value.slots.is_empty() {
+                return Err(ContextError::Invalid(
+                    "tunnel contexts cannot contain Worker files, entry, or slots".into(),
+                ));
+            }
+        } else {
+            if value.entry.starts_with('/') || value.entry.contains("..") {
+                return Err(ContextError::Invalid(
+                    "entry must be a safe relative path".into(),
+                ));
+            }
+            if value.files.is_empty() {
+                return Err(ContextError::Invalid("files must not be empty".into()));
+            }
+            for file in &value.files {
+                if file.path.starts_with('/') || file.path.contains("..") {
+                    return Err(ContextError::Invalid(format!(
+                        "project file path {:?} is unsafe",
+                        file.path
+                    )));
+                }
             }
         }
         Ok(value)
     }
 
-    /// Stable deployed Worker name for a graph environment.
+    /// Whether this component realizes a private Cloudflare Tunnel.
+    #[must_use]
+    pub fn is_tunnel(&self) -> bool {
+        self.tunnel.is_some()
+    }
+
+    /// Stable target resource name for a graph environment.
     pub fn deployed_name(&self) -> Result<String, ContextError> {
         worker_name(&self.worker_name, &self.environment)
     }

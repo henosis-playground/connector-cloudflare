@@ -11,6 +11,7 @@ publish = false
 
 [workspace.dependencies]
 axum = "0.8.4"
+base64 = "0.22.1"
 blake3 = "1.8.2"
 buffa = "0.8.1"
 connectrpc = { version = "0.8.1", features = ["axum", "client", "server"] }

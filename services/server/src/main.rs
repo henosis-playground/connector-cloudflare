@@ -41,6 +41,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok()
             .filter(|value| !value.is_empty()),
         secret_root: PathBuf::from(string_env("HENOSIS_SECRET_ROOT", "/run/secrets")),
+        api_base: string_env(
+            "CLOUDFLARE_API_BASE",
+            "https://api.cloudflare.com/client/v4",
+        ),
+        tunnel_token_file: PathBuf::from(string_env(
+            "HENOSIS_TUNNEL_TOKEN_FILE",
+            "/var/lib/henosis-tunnel/token",
+        )),
     });
     let reconciler = Arc::new(Reconciler::new(
         ReconcilerConfig {

@@ -6,14 +6,24 @@ use std::env;
 use std::path::PathBuf;
 
 use henosis_cloudflare_authoring::derive_component;
+use henosis_cloudflare_authoring::derive_tunnel;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
-    let root = PathBuf::from(
-        arguments
-            .next()
-            .ok_or("usage: derive-component <root> <environment> [producer=64hex ...]")?,
-    );
+    let first = arguments.next().ok_or(
+        "usage: derive-component <root> <environment> [producer=64hex ...] | --tunnel <name> \
+         <environment> <origin-host> <origin-port>",
+    )?;
+    if first == "--tunnel" {
+        let name = arguments.next().ok_or("tunnel name is required")?;
+        let environment = arguments.next().ok_or("environment is required")?;
+        let origin_host = arguments.next().ok_or("origin host is required")?;
+        let origin_port = arguments.next().ok_or("origin port is required")?.parse()?;
+        let component = derive_tunnel(&name, &environment, &origin_host, origin_port)?;
+        println!("{}", serde_json::to_string_pretty(&component)?);
+        return Ok(());
+    }
+    let root = PathBuf::from(first);
     let environment = arguments.next().ok_or("environment is required")?;
     let mut dependencies = BTreeMap::new();
     for argument in arguments {
