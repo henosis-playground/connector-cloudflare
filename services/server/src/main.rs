@@ -1,6 +1,8 @@
 //! Cloudflare connector service process.
 
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    prepare_wrangler_config()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("henosis=info")),
@@ -37,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         api_token: env::var("CLOUDFLARE_API_TOKEN")
             .ok()
             .filter(|value| !value.is_empty()),
+        wrangler_config: Some(wrangler_config_path()),
         account_subdomain: env::var("CLOUDFLARE_ACCOUNT_SUBDOMAIN")
             .ok()
             .filter(|value| !value.is_empty()),
@@ -73,6 +77,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .await?;
     Ok(())
+}
+
+fn prepare_wrangler_config() -> Result<(), std::io::Error> {
+    let Ok(source) = env::var("HENOSIS_WRANGLER_CONFIG_SOURCE") else {
+        return Ok(());
+    };
+    let destination = wrangler_config_path();
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(Path::new(&source), destination)?;
+    Ok(())
+}
+
+fn wrangler_config_path() -> PathBuf {
+    PathBuf::from(string_env(
+        "XDG_CONFIG_HOME",
+        "/var/lib/henosis-connector-cloudflare/xdg",
+    ))
+    .join(".wrangler/config/default.toml")
 }
 
 fn string_env(name: &str, default: &str) -> String {

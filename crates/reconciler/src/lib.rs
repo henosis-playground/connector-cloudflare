@@ -20,6 +20,7 @@ use crate::reconciler::Reconciler;
 pub mod context;
 pub mod proto;
 pub mod reconciler;
+mod retry;
 pub mod slice;
 pub mod target;
 

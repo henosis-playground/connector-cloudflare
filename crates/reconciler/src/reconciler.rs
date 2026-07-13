@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use buffa::MessageField;
+use connectrpc::ErrorCode;
 use connectrpc::client::ClientConfig;
 use connectrpc::client::HttpClient;
 use http::Uri;
@@ -31,6 +32,7 @@ use crate::proto::DiagnosticSeverity;
 use crate::proto::PublicationEvidence;
 use crate::proto::ReportSliceRequest;
 use crate::proto::SliceReport;
+use crate::retry::Backoff;
 use crate::slice::DesiredSlice;
 use crate::slice::SliceError;
 use crate::target::AccountFacts;
@@ -52,10 +54,29 @@ pub trait Reporter: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + '_>>;
 }
 
-/// Core callback transport failure.
+/// Core callback failure.
 #[derive(Debug, Error)]
-#[error("core callback failed: {0}")]
-pub struct ReportError(String);
+pub enum ReportError {
+    /// Core permanently rejected this graph report.
+    #[error("core permanently rejected report: {0}")]
+    Terminal(String),
+    /// Delivery can be retried.
+    #[error("core callback failed: {0}")]
+    Retryable(String),
+}
+
+impl ReportError {
+    fn from_connect(error: &connectrpc::ConnectError) -> Self {
+        if matches!(
+            error.code,
+            ErrorCode::FailedPrecondition | ErrorCode::NotFound
+        ) {
+            Self::Terminal(error.to_string())
+        } else {
+            Self::Retryable(error.to_string())
+        }
+    }
+}
 
 /// Generated-contract callback client.
 #[derive(Clone)]
@@ -86,7 +107,7 @@ impl Reporter for CoreReporter {
                 .report_slice(request)
                 .await
                 .map(|_| ())
-                .map_err(|error| ReportError(error.to_string()))
+                .map_err(|error| ReportError::from_connect(&error))
         })
     }
 }
@@ -122,6 +143,7 @@ pub struct Reconciler {
     reporter: Arc<dyn Reporter>,
     account_facts: Mutex<Option<AccountFacts>>,
     graph_locks: RwLock<HashMap<[u8; 16], Arc<Mutex<()>>>>,
+    reconcile_backoffs: Mutex<HashMap<[u8; 16], Backoff>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +202,7 @@ impl Reconciler {
             reporter,
             account_facts: Mutex::new(None),
             graph_locks: RwLock::new(HashMap::new()),
+            reconcile_backoffs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -189,6 +212,7 @@ impl Reconciler {
         request: &crate::proto::ReconcileSliceRequestView<'_>,
     ) -> Result<u64, ReconcileError> {
         let desired = DesiredSlice::from_request(request)?;
+        self.reset_reconcile_backoff(desired.graph_id).await;
         let lock = self.graph_lock(desired.graph_id).await;
         let _guard = lock.lock().await;
         let mut retained_deployments = HashMap::new();
@@ -383,6 +407,7 @@ impl Reconciler {
                 .await
             {
                 Ok(deployment) => {
+                    self.reset_reconcile_backoff(graph_id).await;
                     if facts.subdomain.is_empty()
                         && let Some(subdomain) = workers_subdomain(&deployment.url)
                     {
@@ -416,7 +441,15 @@ impl Reconciler {
                         None,
                     );
                     self.publish(checkpoint, report, false)?;
-                    self.schedule(graph_id, expected_sequence, Duration::from_secs(2));
+                    let delay = self.next_reconcile_delay(graph_id).await;
+                    tracing::warn!(
+                        graph_id = %hex::encode(graph_id),
+                        sequence = expected_sequence,
+                        ?delay,
+                        error = %error,
+                        "Cloudflare target operation failed; reconciliation backing off"
+                    );
+                    self.schedule(graph_id, expected_sequence, delay);
                     return Ok(());
                 }
             }
@@ -448,6 +481,19 @@ impl Reconciler {
         Ok(value)
     }
 
+    async fn next_reconcile_delay(&self, graph_id: [u8; 16]) -> Duration {
+        self.reconcile_backoffs
+            .lock()
+            .await
+            .entry(graph_id)
+            .or_insert_with(|| Backoff::new(Duration::from_secs(1), Duration::from_mins(2)))
+            .next(None)
+    }
+
+    async fn reset_reconcile_backoff(&self, graph_id: [u8; 16]) {
+        self.reconcile_backoffs.lock().await.remove(&graph_id);
+    }
+
     fn publish(
         self: &Arc<Self>,
         checkpoint: &mut Checkpoint,
@@ -471,7 +517,7 @@ impl Reconciler {
     fn retry_report(self: &Arc<Self>, graph_id: [u8; 16], snapshot: ReportSnapshot) {
         let reconciler = Arc::clone(self);
         tokio::spawn(async move {
-            let mut delay = Duration::from_millis(250);
+            let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_mins(2));
             loop {
                 let Ok(Some(current)) = reconciler.load(graph_id) else {
                     return;
@@ -514,17 +560,40 @@ impl Reconciler {
                         }
                         return;
                     }
-                    Err(error) => {
+                    Err(ReportError::Terminal(error)) => {
+                        let lock = reconciler.graph_lock(graph_id).await;
+                        let _guard = lock.lock().await;
+                        if let Ok(Some(mut current)) = reconciler.load(graph_id)
+                            && current
+                                .pending_report
+                                .as_ref()
+                                .map(|value| &value.request_id)
+                                == Some(&snapshot.request_id)
+                        {
+                            current.pending_report = None;
+                            current.retired = true;
+                            let _ = reconciler.save(&current);
+                            tracing::warn!(
+                                graph_id = %hex::encode(graph_id),
+                                sequence = snapshot.report.sequence.unwrap_or_default(),
+                                error = %error,
+                                "core permanently rejected Cloudflare graph report; checkpoint tombstoned"
+                            );
+                        }
+                        return;
+                    }
+                    Err(ReportError::Retryable(error)) => {
+                        let delay = backoff.next(None);
                         tracing::warn!(
                             graph_id = %hex::encode(graph_id),
                             sequence = snapshot.report.sequence.unwrap_or_default(),
+                            ?delay,
                             error = %error,
-                            "cloudflare report delivery failed"
+                            "Cloudflare report delivery failed; backing off"
                         );
+                        tokio::time::sleep(delay).await;
                     }
                 }
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(30));
             }
         });
     }
@@ -535,13 +604,16 @@ impl Reconciler {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            if let Err(error) = reconciler.reconcile_once(graph_id, sequence).await {
-                tracing::error!(
+            if let Err(error) = reconciler.clone().reconcile_once(graph_id, sequence).await {
+                let delay = reconciler.next_reconcile_delay(graph_id).await;
+                tracing::warn!(
                     graph_id = %hex::encode(graph_id),
                     sequence,
+                    ?delay,
                     error = %error,
-                    "cloudflare reconciliation pass failed"
+                    "Cloudflare reconciliation pass failed; backing off"
                 );
+                reconciler.schedule(graph_id, sequence, delay);
             }
         });
     }
@@ -770,4 +842,27 @@ fn state(error: impl std::fmt::Display) -> ReconcileError {
 }
 fn target_state(error: &TargetError) -> ReconcileError {
     ReconcileError::State(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_precondition_report_rejection_is_terminal() {
+        let error = ReportError::from_connect(&connectrpc::ConnectError::new(
+            ErrorCode::FailedPrecondition,
+            "operation failed a graph precondition",
+        ));
+        assert!(matches!(error, ReportError::Terminal(_)));
+    }
+
+    #[test]
+    fn unavailable_report_failure_is_retryable() {
+        let error = ReportError::from_connect(&connectrpc::ConnectError::new(
+            ErrorCode::Unavailable,
+            "core restarting",
+        ));
+        assert!(matches!(error, ReportError::Retryable(_)));
+    }
 }
